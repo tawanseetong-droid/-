@@ -57,6 +57,13 @@ async def test_paypal_credentials():
         }
 
 
+@router.on_event("startup")
+async def paypal_startup_check():
+    result = await test_paypal_credentials()
+    # Intentionally log only a safe result; never log credentials or access tokens.
+    print(f"PAYPAL_STARTUP_CHECK ok={result.get('ok')} mode={result.get('mode')} status={result.get('status_code', 'oauth-ok' if result.get('ok') else 'n/a')}")
+
+
 @router.get("/api/paypal/status")
 def paypal_status():
     client_id = bool(os.getenv("PAYPAL_CLIENT_ID"))
