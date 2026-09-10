@@ -1,66 +1,84 @@
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
+import os, sqlite3, asyncio
 from datetime import datetime, timezone
-import os, sqlite3, httpx, re
+import httpx, xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 
+BASE=os.path.dirname(os.path.dirname(__file__))
+DB=os.getenv('DB_PATH',os.path.join(BASE,'money_hunter.db'))
 app=FastAPI(title='Money Hunter AI Cloud',version='10.1')
-DB='/tmp/money_hunter.db'
-SOURCES=[
- ('Freebies 4 Mom','https://freebies4mom.com/feed/'),
- ('Reddit Freebies','https://www.reddit.com/r/freebies/.rss'),
- ('GameDeals Free','https://www.reddit.com/r/GameDeals/search.rss?q=free&restrict_sr=1&sort=new')]
-KEYS=['free','freebie','giveaway','coupon','voucher','cashback','rebate','grant','sample','แจกฟรี','ของฟรี','คูปอง','เงินคืน']
-SCAM=['seed phrase','private key','otp','gift card payment','โอนเงินก่อน']
+SOURCES=[('Reddit Freebies','https://www.reddit.com/r/freebies/.rss'),('GameDeals Free','https://www.reddit.com/r/GameDeals/search.rss?q=free&restrict_sr=1&sort=new')]
+KEYS=['free','freebie','giveaway','coupon','voucher','cashback','rebate','grant','sample','แจกฟรี','คูปอง','เงินคืน']
+SCAM=['seed phrase','private key','otp','gift card payment','pay a fee to receive','โอนเงินก่อน','รหัส otp']
 
-def db():
- c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
+def conn():
+ c=sqlite3.connect(DB,timeout=15);c.row_factory=sqlite3.Row;return c
 
-def init():
- c=db(); c.executescript('''CREATE TABLE IF NOT EXISTS deals(id INTEGER PRIMARY KEY,title TEXT,url TEXT UNIQUE,source TEXT,status TEXT DEFAULT 'พบรายการ',created TEXT DEFAULT CURRENT_TIMESTAMP);CREATE TABLE IF NOT EXISTS ledger(id INTEGER PRIMARY KEY,amount REAL,currency TEXT,provider TEXT,status TEXT,created TEXT DEFAULT CURRENT_TIMESTAMP);'''); c.commit(); c.close()
-init()
+def init_db():
+ c=conn();c.execute('CREATE TABLE IF NOT EXISTS deals(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT,url TEXT UNIQUE,source TEXT,kind TEXT,risk TEXT,country TEXT,created_at TEXT)');c.execute('CREATE TABLE IF NOT EXISTS ledger(id INTEGER PRIMARY KEY AUTOINCREMENT,amount REAL,currency TEXT,status TEXT,reference TEXT,created_at TEXT)');c.commit();c.close()
+init_db()
 
-@app.get('/api/health')
-def health(): return {'ok':True,'service':'Money Hunter AI Cloud','version':'10.1'}
+def txt(s):return ' '.join(BeautifulSoup(s or '','html.parser').get_text(' ',strip=True).split())
+def kind(t):
+ x=t.lower()
+ if 'cashback' in x or 'rebate' in x or 'เงินคืน' in x:return 'Cashback'
+ if 'coupon' in x or 'voucher' in x or 'คูปอง' in x:return 'Coupon'
+ if 'grant' in x:return 'Grant'
+ if 'giveaway' in x or 'แจกฟรี' in x:return 'Giveaway'
+ if 'sample' in x:return 'Free Sample'
+ return 'Freebie'
+def risk(t):return 'high' if any(k in t.lower() for k in SCAM) else 'low'
+def country(t):
+ x=t.lower()
+ if 'us only' in x:return 'United States'
+ if 'uk only' in x:return 'United Kingdom'
+ if 'thailand only' in x or 'ประเทศไทยเท่านั้น' in x:return 'Thailand'
+ return 'Worldwide/Check source'
 
-@app.get('/api/v10/readiness')
-def ready():
- return {'ready_for_discovery':True,'ready_for_live_receiving':False,'ready_for_auto_claim':False,'ready_for_auto_payout':False,'checks':[{'name':'แหล่งค้นหา','ok':True,'detail':'3 แหล่งเริ่มต้นพร้อมค้นหา'},{'name':'บัญชีรับเงินจริง','ok':False,'detail':'ยังไม่ได้เชื่อม PayPal / Wise / Stripe'},{'name':'Auto-Claim API','ok':False,'detail':'จะเปิดเฉพาะบริการที่อนุญาต API/OAuth'},{'name':'ถอน THB','ok':False,'detail':'ยังไม่ได้เชื่อมบัญชีปลายทาง'}],'important':'ยอดเงินจริงจะนับเฉพาะธุรกรรมที่ผู้ให้บริการยืนยันแล้ว'}
-
-@app.post('/api/scan')
-async def scan():
- added=0; checked=0
- async with httpx.AsyncClient(headers={'User-Agent':'MoneyHunterAI/10.1'},follow_redirects=True,timeout=15) as client:
+async def scan_once():
+ added=0
+ async with httpx.AsyncClient(headers={'User-Agent':'MoneyHunterAI/10.1'},follow_redirects=True,timeout=20) as client:
   for name,url in SOURCES:
    try:
-    r=await client.get(url); checked+=1
-    soup=BeautifulSoup(r.text,'xml')
-    for item in soup.find_all(['item','entry'])[:35]:
-     title=(item.title.get_text(' ',strip=True) if item.title else '')
-     low=title.lower()
-     if not any(k in low for k in KEYS) or any(k in low for k in SCAM): continue
-     link=''
-     l=item.find('link')
-     if l: link=(l.get('href') or l.get_text(strip=True) or '')
-     c=db()
-     try:
-      c.execute('INSERT OR IGNORE INTO deals(title,url,source) VALUES(?,?,?)',(title[:300],link,name)); added+=c.total_changes; c.commit()
-     finally:c.close()
-   except Exception: pass
- return {'ok':True,'sources_checked':checked,'added':added}
+    r=await client.get(url);r.raise_for_status();root=ET.fromstring(r.content)
+    for e in root.iter():
+     if e.tag.split('}')[-1].lower() not in ('item','entry'):continue
+     title=summary=link=''
+     for ch in list(e):
+      n=ch.tag.split('}')[-1].lower()
+      if n=='title' and not title:title=''.join(ch.itertext()).strip()
+      elif n in ('summary','description','content') and not summary:summary=' '.join(''.join(ch.itertext()).split())
+      elif n=='link' and not link:link=(ch.attrib.get('href') or (ch.text or '')).strip()
+     text=txt(title+' '+summary)
+     if not title or not any(k in text.lower() for k in KEYS):continue
+     c=conn();c.execute('INSERT OR IGNORE INTO deals(title,url,source,kind,risk,country,created_at) VALUES(?,?,?,?,?,?,?)',(txt(title)[:300],link or url,name,kind(text),risk(text),country(text),datetime.now(timezone.utc).isoformat()));added+=c.total_changes;c.commit();c.close()
+   except Exception:pass
+ return added
 
+@app.on_event('startup')
+async def startup():
+ async def loop():
+  await asyncio.sleep(3)
+  while True:
+   try:await scan_once()
+   except Exception:pass
+   await asyncio.sleep(3600)
+ asyncio.create_task(loop())
+
+@app.get('/api/search')
+async def search():return {'ok':True,'added':await scan_once()}
 @app.get('/api/deals')
 def deals():
- c=db(); rows=[dict(x) for x in c.execute('SELECT * FROM deals ORDER BY id DESC LIMIT 100')]; c.close(); return rows
-
+ c=conn();r=[dict(x) for x in c.execute("SELECT * FROM deals WHERE risk!='high' ORDER BY id DESC LIMIT 200")];c.close();return r
 @app.get('/api/wallet')
 def wallet():
- c=db(); rows=[dict(x) for x in c.execute("SELECT * FROM ledger WHERE status='confirmed' ORDER BY id DESC")]; c.close()
- return {'confirmed_transactions':rows,'total_thb_estimate':0 if not rows else None,'note':'นับเฉพาะธุรกรรม confirmed จากผู้ให้บริการ ไม่รวมมูลค่าโฆษณาของดีล'}
+ c=conn();rows=[dict(x) for x in c.execute("SELECT * FROM ledger WHERE status='confirmed' ORDER BY id DESC")];c.close();total=sum(float(x['amount']) for x in rows if x['currency'].upper()=='THB');return {'confirmed_thb':round(total,2),'transactions':rows,'note':'นับเฉพาะธุรกรรมที่ยืนยันแล้ว'}
+@app.get('/api/readiness')
+def readiness():return {'discovery':True,'live_money_actions':False,'live_payouts':False,'provider_connected':False,'message':'ค้นหาได้แล้ว; การรับ/ถอนเงินจริงจะเปิดหลังเชื่อม provider ที่ได้รับอนุญาต'}
+@app.get('/health')
+def health():return {'ok':True,'service':'money-hunter-ai'}
 
-HTML='''<!doctype html><html lang="th"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Money Hunter AI</title><style>*{box-sizing:border-box}body{margin:0;background:#f4f6fa;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Noto Sans Thai",sans-serif}.app{max-width:560px;margin:auto;min-height:100vh;background:white;padding:24px 18px 90px}.top{display:flex;justify-content:space-between;align-items:center}.logo{font-weight:850;font-size:24px}.pill{background:#eaf8ef;color:#16733a;padding:7px 11px;border-radius:99px;font-size:13px}.hero{margin-top:22px;padding:22px;border-radius:24px;background:linear-gradient(135deg,#151b2c,#283759);color:white}.hero small{opacity:.75}.money{font-size:38px;font-weight:850;margin:8px 0}.btn{border:0;border-radius:16px;padding:15px 18px;font-weight:800;font-size:16px;width:100%;cursor:pointer;background:#1d6cff;color:white}.btn:disabled{opacity:.55}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:16px 0}.card{border:1px solid #e8ebf1;border-radius:18px;padding:16px}.num{font-size:24px;font-weight:850}.flow{display:flex;gap:6px;align-items:center;font-size:12px;overflow:auto;padding:10px 0}.step{white-space:nowrap;background:#f1f4f8;padding:8px;border-radius:10px}.section{font-weight:850;font-size:19px;margin:25px 0 10px}.deal{padding:14px 0;border-bottom:1px solid #eee}.deal a{color:#172033;text-decoration:none;font-weight:700}.source{font-size:12px;color:#778095;margin-top:4px}.warn{background:#fff8df;padding:12px;border-radius:14px;font-size:13px;margin-top:14px}.bottom{position:fixed;bottom:0;left:50%;transform:translateX(-50%);width:min(560px,100%);background:#fff;border-top:1px solid #e9ebef;display:flex;justify-content:space-around;padding:12px 5px 18px;font-size:12px}.bottom b{color:#1d6cff}#status{font-size:13px;margin-top:10px;color:#667085}</style></head><body><main class="app"><div class="top"><div class="logo">Money Hunter AI</div><div class="pill">● Cloud ทำงาน</div></div><section class="hero"><small>เงินจริงที่ยืนยันแล้ว</small><div class="money">฿0.00</div><small>ไม่นับมูลค่าดีลจนกว่าจะมีธุรกรรมยืนยัน</small></section><div class="grid"><div class="card"><div class="num" id="found">0</div><div>รายการที่พบ</div></div><div class="card"><div class="num">0</div><div>จ่ายแล้ว</div></div></div><button class="btn" id="scan" onclick="scanNow()">ค้นหาให้ตอนนี้</button><div id="status">พร้อมค้นหาแหล่งสาธารณะ</div><div class="flow"><span class="step">ค้นหา</span>→<span class="step">ตรวจสิทธิ์</span>→<span class="step">ยืนยันจ่าย</span>→<span class="step">ถอน THB</span></div><div class="warn">ระบบจะไม่ข้าม CAPTCHA, ไม่สร้างบัญชีปลอม และไม่รับสิทธิ์แทนในบริการที่ไม่อนุญาต การรับอัตโนมัติจะเปิดเฉพาะ API/OAuth ที่ได้รับอนุญาตเท่านั้น</div><div class="section">โอกาสล่าสุด</div><div id="deals">ยังไม่มีรายการ กด “ค้นหาให้ตอนนี้”</div></main><nav class="bottom"><b>หน้าหลัก</b><span>ค้นหา</span><span>กำลังรับ</span><span>กระเป๋า</span><span>ตั้งค่า</span></nav><script>async function load(){let r=await fetch('/api/deals');let d=await r.json();found.textContent=d.length;deals.innerHTML=d.length?d.map(x=>`<div class="deal"><a href="${x.url||'#'}" target="_blank">${esc(x.title)}</a><div class="source">${esc(x.source)} · ${esc(x.status)}</div></div>`).join(''):'ยังไม่มีรายการ กด “ค้นหาให้ตอนนี้”'}function esc(s){return String(s||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}async function scanNow(){let b=document.getElementById('scan');b.disabled=true;b.textContent='กำลังค้นหา…';status.textContent='กำลังตรวจแหล่งข้อมูล';try{let r=await fetch('/api/scan',{method:'POST'});let j=await r.json();status.textContent=`ตรวจ ${j.sources_checked} แหล่ง · เพิ่ม ${j.added} รายการ`;await load()}catch(e){status.textContent='ค้นหาไม่สำเร็จ ลองใหม่อีกครั้ง'}b.disabled=false;b.textContent='ค้นหาให้ตอนนี้'}load()</script></body></html>'''
-
+HTML='''<!doctype html><html lang="th"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Money Hunter AI</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f6f7fb;margin:0;color:#18202a}.wrap{max-width:760px;margin:auto;padding:20px}.hero{background:#111827;color:#fff;border-radius:24px;padding:24px}.money{font-size:42px;font-weight:800;margin:8px 0}.btn{border:0;border-radius:14px;padding:14px 18px;font-size:16px;font-weight:700;cursor:pointer}.primary{background:#22c55e;color:#06240f;width:100%;margin-top:14px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:14px}.card{background:#fff;border-radius:18px;padding:16px;box-shadow:0 4px 18px #0000000d}.deal{margin-top:10px;border-top:1px solid #eee;padding-top:12px}.tag{display:inline-block;background:#eef2ff;padding:5px 9px;border-radius:999px;font-size:12px}.muted{color:#6b7280;font-size:13px}a{color:#2563eb;text-decoration:none}</style></head><body><div class=wrap><div class=hero><div>Money Hunter AI</div><div class=muted style="color:#cbd5e1">ค้นหา → ตรวจสิทธิ์ → ยืนยันจ่าย → ถอน THB</div><div class=money id=money>฿0.00</div><div>เงินจริงที่ยืนยันแล้ว</div><button id=scanBtn class="btn primary" onclick="scan()">ค้นหาให้ตอนนี้</button></div><div class=grid><div class=card><b>สถานะระบบ</b><div id=ready class=muted>กำลังตรวจ...</div></div><div class=card><b>รายการที่พบ</b><div id=count style="font-size:30px;font-weight:800">0</div></div></div><div class=card style="margin-top:14px"><b>โอกาสล่าสุด</b><div id=deals></div></div></div><script>async function load(){let w=await fetch('/api/wallet').then(r=>r.json());money.textContent='฿'+Number(w.confirmed_thb||0).toLocaleString('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2});let rs=await fetch('/api/readiness').then(r=>r.json());ready.textContent=rs.message;let ds=await fetch('/api/deals').then(r=>r.json());count.textContent=ds.length;deals.innerHTML=ds.slice(0,20).map(d=>`<div class=deal><span class=tag>${d.kind}</span> <span class=tag>${d.country}</span><div><b>${d.title}</b></div><div class=muted>${d.source} · ความเสี่ยง ${d.risk}</div><a href="${d.url}" target=_blank rel=noopener>เปิดแหล่งต้นทาง</a></div>`).join('')||'<div class=muted style="margin-top:10px">ยังไม่มีรายการ กด “ค้นหาให้ตอนนี้”</div>'}async function scan(){scanBtn.disabled=true;scanBtn.textContent='กำลังค้นหา...';await fetch('/api/search');await load();scanBtn.disabled=false;scanBtn.textContent='ค้นหาให้ตอนนี้'}load()</script></body></html>'''
 @app.get('/',response_class=HTMLResponse)
-def home(): return HTML
-@app.get('/v10',response_class=HTMLResponse)
-def v10(): return HTML
+def home():return HTML
