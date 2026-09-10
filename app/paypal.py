@@ -12,21 +12,7 @@ def _paypal_base_url() -> str:
     return "https://api-m.sandbox.paypal.com"
 
 
-@router.get("/api/paypal/status")
-def paypal_status():
-    client_id = bool(os.getenv("PAYPAL_CLIENT_ID"))
-    client_secret = bool(os.getenv("PAYPAL_CLIENT_SECRET"))
-    mode = os.getenv("PAYPAL_MODE", "sandbox").strip().lower()
-    return {
-        "configured": client_id and client_secret,
-        "mode": mode,
-        "live_money_actions": os.getenv("ALLOW_LIVE_MONEY_ACTIONS", "false").lower() == "true",
-        "live_payouts": os.getenv("ALLOW_LIVE_PAYOUTS", "false").lower() == "true",
-    }
-
-
-@router.get("/api/paypal/test")
-async def paypal_test():
+async def test_paypal_credentials():
     client_id = os.getenv("PAYPAL_CLIENT_ID", "").strip()
     client_secret = os.getenv("PAYPAL_CLIENT_SECRET", "").strip()
     mode = os.getenv("PAYPAL_MODE", "sandbox").strip().lower()
@@ -69,3 +55,21 @@ async def paypal_test():
             "mode": mode,
             "message": f"เชื่อมต่อ PayPal ไม่สำเร็จ: {type(exc).__name__}",
         }
+
+
+@router.get("/api/paypal/status")
+def paypal_status():
+    client_id = bool(os.getenv("PAYPAL_CLIENT_ID"))
+    client_secret = bool(os.getenv("PAYPAL_CLIENT_SECRET"))
+    mode = os.getenv("PAYPAL_MODE", "sandbox").strip().lower()
+    return {
+        "configured": client_id and client_secret,
+        "mode": mode,
+        "live_money_actions": os.getenv("ALLOW_LIVE_MONEY_ACTIONS", "false").lower() == "true",
+        "live_payouts": os.getenv("ALLOW_LIVE_PAYOUTS", "false").lower() == "true",
+    }
+
+
+@router.get("/api/paypal/test")
+async def paypal_test():
+    return await test_paypal_credentials()
