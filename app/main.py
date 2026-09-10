@@ -8,39 +8,47 @@ from app.paypal import router as paypal_router
 
 BASE=os.path.dirname(os.path.dirname(__file__))
 DB=os.getenv('DB_PATH',os.path.join(BASE,'money_hunter.db'))
-app=FastAPI(title='Money Hunter AI Cloud',version='11.1')
+TARGET_COUNTRY=os.getenv('TARGET_COUNTRY','Thailand').strip() or 'Thailand'
+DISCOVERY_SCOPE=os.getenv('DISCOVERY_SCOPE','worldwide').strip().lower()
+AUTO_CLAIM_ENABLED=os.getenv('AUTO_CLAIM_ENABLED','true').strip().lower()=='true'
+app=FastAPI(title='Money Hunter AI Cloud',version='11.2')
 app.include_router(paypal_router)
 
+# Worldwide public discovery feeds. Failures of individual feeds are ignored safely.
 SOURCES=[
  ('Reddit Freebies','https://www.reddit.com/r/freebies/.rss'),
  ('GameDeals Free','https://www.reddit.com/r/GameDeals/search.rss?q=free&restrict_sr=1&sort=new'),
  ('FreeGameFindings','https://www.reddit.com/r/FreeGameFindings/.rss'),
+ ('Freebies UK','https://www.reddit.com/r/freebiesUK/.rss'),
+ ('Freebies Canada','https://www.reddit.com/r/freebiescanada/.rss'),
+ ('Freebies India','https://www.reddit.com/r/FreebiesIndia/.rss'),
 ]
 KEYS=['free','freebie','giveaway','coupon','voucher','cashback','rebate','grant','sample','100% off','แจกฟรี','คูปอง','เงินคืน','ของฟรี']
 SCAM=['seed phrase','private key','otp','gift card payment','pay a fee to receive','advance fee','wire money','โอนเงินก่อน','รหัส otp']
-HARD_EXCLUDE=['us only','u.s. only','usa only','united states only','uk only','canada only','australia only','in-store only']
 PURCHASE_WORDS=['purchase required','with purchase','buy one','spend $','minimum spend','order required','ต้องซื้อ','ยอดซื้อ','ซื้อครบ']
 CARD_WORDS=['credit card required','debit card required','card required','บัตรเครดิต','บัตรเดบิต']
 SUBSCRIPTION_WORDS=['subscription required','subscribe and save','paid membership','trial converts','สมาชิกแบบเสียเงิน']
 SURVEY_WORDS=['complete a survey','survey required','ทำแบบสอบถาม']
 REFERRAL_WORDS=['refer a friend','referral required','invite friends','ชวนเพื่อน']
+WORLD_HINTS=['worldwide','global','international','available everywhere','ทั่วโลก','region free','region-free']
 THAI_HINTS=['thailand','thai only','ประเทศไทย','กรุงเทพ','bangkok','.th']
-WORLD_HINTS=['worldwide','global','international','available everywhere','ทั่วโลก']
+REGION_HINTS={
+ 'United States':['us only','u.s. only','usa only','united states only','united states residents','u.s. residents'],
+ 'United Kingdom':['uk only','united kingdom only','uk residents'],
+ 'Canada':['canada only','canadian residents'],
+ 'Australia':['australia only','australian residents'],
+ 'India':['india only','indian residents'],
+}
 
 def conn():
  c=sqlite3.connect(DB,timeout=15);c.row_factory=sqlite3.Row;return c
 
-def col_exists(c, table, col):
- return any(r[1]==col for r in c.execute(f'PRAGMA table_info({table})'))
+def col_exists(c,table,col):return any(r[1]==col for r in c.execute(f'PRAGMA table_info({table})'))
 
 def init_db():
- c=conn()
- c.execute('CREATE TABLE IF NOT EXISTS deals(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT,url TEXT UNIQUE,source TEXT,kind TEXT,risk TEXT,country TEXT,created_at TEXT)')
- for name,typ,default in [
-  ('eligibility','TEXT',"'review'"),('eligibility_reason','TEXT',"''"),('simple_offer','INTEGER','0'),
-  ('requires_purchase','INTEGER','0'),('requires_card','INTEGER','0'),('requires_subscription','INTEGER','0'),
-  ('requires_survey','INTEGER','0'),('requires_referral','INTEGER','0'),('claim_mode','TEXT',"'manual'"),('claim_status','TEXT',"'new'")]:
-  if not col_exists(c,'deals',name): c.execute(f'ALTER TABLE deals ADD COLUMN {name} {typ} DEFAULT {default}')
+ c=conn();c.execute('CREATE TABLE IF NOT EXISTS deals(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT,url TEXT UNIQUE,source TEXT,kind TEXT,risk TEXT,country TEXT,created_at TEXT)')
+ for name,typ,default in [('eligibility','TEXT',"'review'"),('eligibility_reason','TEXT',"''"),('simple_offer','INTEGER','0'),('requires_purchase','INTEGER','0'),('requires_card','INTEGER','0'),('requires_subscription','INTEGER','0'),('requires_survey','INTEGER','0'),('requires_referral','INTEGER','0'),('claim_mode','TEXT',"'manual'"),('claim_status','TEXT',"'new'")]:
+  if not col_exists(c,'deals',name):c.execute(f'ALTER TABLE deals ADD COLUMN {name} {typ} DEFAULT {default}')
  c.execute('CREATE TABLE IF NOT EXISTS ledger(id INTEGER PRIMARY KEY AUTOINCREMENT,amount REAL,currency TEXT,status TEXT,reference TEXT,created_at TEXT)')
  c.execute('CREATE TABLE IF NOT EXISTS claim_log(id INTEGER PRIMARY KEY AUTOINCREMENT,deal_id INTEGER,status TEXT,message TEXT,created_at TEXT)')
  c.commit();c.close()
@@ -58,26 +66,34 @@ def kind(t):
  return 'Freebie'
 def risk(t):return 'high' if any(k in t.lower() for k in SCAM) else 'low'
 
+def detected_region(x):
+ for region,hints in REGION_HINTS.items():
+  if any(k in x for k in hints):return region
+ return None
+
 def classify(text):
  x=text.lower();rp=any(k in x for k in PURCHASE_WORDS);rc=any(k in x for k in CARD_WORDS);rs=any(k in x for k in SUBSCRIPTION_WORDS);rv=any(k in x for k in SURVEY_WORDS);rr=any(k in x for k in REFERRAL_WORDS);complex_req=rp or rc or rs or rv or rr
- if any(k in x for k in HARD_EXCLUDE):elig='ineligible';reason='พบเงื่อนไขจำกัดประเทศ/หน้าร้านที่ไม่เหมาะกับไทย'
- elif any(k in x for k in THAI_HINTS):elig='eligible';reason='พบข้อความที่รองรับประเทศไทย'
- elif any(k in x for k in WORLD_HINTS):elig='eligible';reason='ระบุว่าใช้ได้ทั่วโลก/นานาชาติ'
- else:elig='review';reason='ยังไม่พบข้อความยืนยันว่าใช้ได้ในประเทศไทย'
+ region=detected_region(x)
+ target=TARGET_COUNTRY.lower()
+ if any(k in x for k in WORLD_HINTS):elig='eligible';reason='ระบุว่าใช้ได้ทั่วโลก/ไม่มีข้อจำกัดภูมิภาค'
+ elif any(k in x for k in THAI_HINTS):elig='eligible';reason='พบข้อความรองรับประเทศไทย'
+ elif region:
+  elig='eligible' if region.lower()==target else 'regional'
+  reason=f'จำกัดภูมิภาค: {region}'
+ else:elig='review';reason='ค้นพบจากโหมดทั่วโลก แต่ยังต้องยืนยันประเทศ/เงื่อนไขก่อนรับ'
  simple=(elig=='eligible' and not complex_req)
  return elig,reason,int(simple),int(rp),int(rc),int(rs),int(rv),int(rr)
 
 def country_from(text,elig):
- x=text.lower()
- if any(k in x for k in THAI_HINTS):return 'Thailand'
+ x=text.lower();region=detected_region(x)
  if any(k in x for k in WORLD_HINTS):return 'Worldwide'
- if 'us only' in x or 'u.s. only' in x or 'usa only' in x:return 'United States'
- if 'uk only' in x:return 'United Kingdom'
- return 'Check source' if elig!='ineligible' else 'Not Thailand'
+ if any(k in x for k in THAI_HINTS):return 'Thailand'
+ if region:return region
+ return 'Unknown/Global check'
 
 async def scan_once():
  added=0
- async with httpx.AsyncClient(headers={'User-Agent':'MoneyHunterAI/11.1 personal-use'},follow_redirects=True,timeout=20) as client:
+ async with httpx.AsyncClient(headers={'User-Agent':'MoneyHunterAI/11.2 personal-use worldwide'},follow_redirects=True,timeout=20) as client:
   for name,url in SOURCES:
    try:
     r=await client.get(url);r.raise_for_status();root=ET.fromstring(r.content)
@@ -108,27 +124,28 @@ def authorized_connectors():
  except Exception:return {}
 
 def auto_claimable(d):
- cfg=authorized_connectors().get(d['source']);return bool(d.get('simple_offer') and d.get('eligibility')=='eligible' and d.get('risk')!='high' and isinstance(cfg,dict) and cfg.get('endpoint') and cfg.get('automation_permitted'))
+ cfg=authorized_connectors().get(d['source']);return bool(AUTO_CLAIM_ENABLED and d.get('simple_offer') and d.get('eligibility')=='eligible' and d.get('risk')!='high' and isinstance(cfg,dict) and cfg.get('endpoint') and cfg.get('automation_permitted'))
 
 async def claim_one(d):
  if not d:return {'ok':False,'message':'ไม่พบรายการ'}
+ if not AUTO_CLAIM_ENABLED:return {'ok':False,'message':'โหมดรับอัตโนมัติถูกปิด'}
  if d['risk']=='high' or not d['simple_offer'] or d['eligibility']!='eligible':return {'ok':False,'message':'รายการนี้ยังไม่ผ่านเงื่อนไขรับอัตโนมัติ'}
  cfg=authorized_connectors().get(d['source'])
  if not isinstance(cfg,dict) or not cfg.get('endpoint') or not cfg.get('automation_permitted'):
-  return {'ok':False,'needs_user':True,'message':'แหล่งนี้ยังไม่มี API/สิทธิ์ที่อนุญาตให้ AI กดรับแทน'}
- headers={'User-Agent':'MoneyHunterAI/11.1'};token_env=cfg.get('token_env')
+  return {'ok':False,'needs_user':True,'message':'ยังไม่มีช่องทาง API/automation ที่เจ้าของแหล่งอนุญาต'}
+ headers={'User-Agent':'MoneyHunterAI/11.2'};token_env=cfg.get('token_env')
  if token_env and os.getenv(token_env):headers['Authorization']='Bearer '+os.getenv(token_env)
  try:
-  async with httpx.AsyncClient(timeout=20,follow_redirects=False) as client:res=await client.post(cfg['endpoint'],json={'offer_url':d['url'],'offer_title':d['title']},headers=headers)
+  async with httpx.AsyncClient(timeout=20,follow_redirects=False) as client:res=await client.post(cfg['endpoint'],json={'offer_url':d['url'],'offer_title':d['title'],'target_country':TARGET_COUNTRY},headers=headers)
   status='submitted' if 200<=res.status_code<300 else 'failed';msg='ส่งคำขอรับสิทธิ์อัตโนมัติแล้ว' if status=='submitted' else f'ผู้ให้บริการตอบ HTTP {res.status_code}'
  except Exception as exc:status='failed';msg=f'เชื่อมต่อแหล่งรับสิทธิ์ไม่สำเร็จ: {type(exc).__name__}'
  c=conn();c.execute('UPDATE deals SET claim_status=?,claim_mode=? WHERE id=?',(status,'authorized_api',d['id']));c.execute('INSERT INTO claim_log(deal_id,status,message,created_at) VALUES(?,?,?,?)',(d['id'],status,msg,datetime.now(timezone.utc).isoformat()));c.commit();c.close();return {'ok':status=='submitted','status':status,'message':msg}
 
 async def auto_claim_authorized():
- c=conn();rows=[dict(x) for x in c.execute("SELECT * FROM deals WHERE simple_offer=1 AND risk!='high' AND eligibility='eligible' AND claim_status='ready' LIMIT 25")];c.close();done=0
+ if not AUTO_CLAIM_ENABLED:return 0
+ c=conn();rows=[dict(x) for x in c.execute("SELECT * FROM deals WHERE simple_offer=1 AND risk!='high' AND eligibility='eligible' AND claim_status='ready' LIMIT 50")];c.close();done=0
  for d in rows:
-  if not auto_claimable(d):continue
-  await claim_one(d);done+=1
+  if auto_claimable(d):await claim_one(d);done+=1
  return done
 
 @app.on_event('startup')
@@ -143,10 +160,10 @@ async def startup():
 
 @app.get('/api/search')
 async def search():
- a=await scan_once();b=await auto_claim_authorized();return {'ok':True,'added':a,'auto_claim_attempts':b}
+ a=await scan_once();b=await auto_claim_authorized();return {'ok':True,'scope':DISCOVERY_SCOPE,'added':a,'auto_claim_attempts':b}
 @app.get('/api/deals')
 def deals():
- c=conn();rows=[dict(x) for x in c.execute("SELECT * FROM deals WHERE risk!='high' ORDER BY simple_offer DESC, CASE eligibility WHEN 'eligible' THEN 0 WHEN 'review' THEN 1 ELSE 2 END, id DESC LIMIT 250")];c.close()
+ c=conn();rows=[dict(x) for x in c.execute("SELECT * FROM deals WHERE risk!='high' ORDER BY simple_offer DESC, CASE eligibility WHEN 'eligible' THEN 0 WHEN 'review' THEN 1 ELSE 2 END, id DESC LIMIT 400")];c.close()
  for d in rows:d['auto_claimable']=auto_claimable(d)
  return rows
 @app.post('/api/claim/{deal_id}')
@@ -156,16 +173,16 @@ async def claim(deal_id:int):
 async def claim_all():return {'ok':True,'attempted':await auto_claim_authorized()}
 @app.get('/api/stats')
 def stats():
- c=conn();total=c.execute("SELECT COUNT(*) FROM deals WHERE risk!='high'").fetchone()[0];eligible=c.execute("SELECT COUNT(*) FROM deals WHERE risk!='high' AND eligibility='eligible'").fetchone()[0];simple=c.execute("SELECT COUNT(*) FROM deals WHERE risk!='high' AND simple_offer=1 AND eligibility='eligible'").fetchone()[0];review=c.execute("SELECT COUNT(*) FROM deals WHERE risk!='high' AND eligibility='review'").fetchone()[0];submitted=c.execute("SELECT COUNT(*) FROM deals WHERE claim_status='submitted'").fetchone()[0];c.close();return {'total':total,'eligible':eligible,'simple':simple,'review':review,'submitted':submitted}
+ c=conn();total=c.execute("SELECT COUNT(*) FROM deals WHERE risk!='high'").fetchone()[0];eligible=c.execute("SELECT COUNT(*) FROM deals WHERE risk!='high' AND eligibility='eligible'").fetchone()[0];regional=c.execute("SELECT COUNT(*) FROM deals WHERE risk!='high' AND eligibility='regional'").fetchone()[0];simple=c.execute("SELECT COUNT(*) FROM deals WHERE risk!='high' AND simple_offer=1 AND eligibility='eligible'").fetchone()[0];review=c.execute("SELECT COUNT(*) FROM deals WHERE risk!='high' AND eligibility='review'").fetchone()[0];submitted=c.execute("SELECT COUNT(*) FROM deals WHERE claim_status='submitted'").fetchone()[0];c.close();return {'total':total,'eligible':eligible,'regional':regional,'simple':simple,'review':review,'submitted':submitted}
 @app.get('/api/wallet')
 def wallet():
  c=conn();rows=[dict(x) for x in c.execute("SELECT * FROM ledger WHERE status='confirmed' ORDER BY id DESC")];c.close();total=sum(float(x['amount']) for x in rows if x['currency'].upper()=='THB');return {'confirmed_thb':round(total,2),'transactions':rows,'note':'นับเฉพาะธุรกรรมที่ผู้ให้บริการยืนยันแล้ว'}
 @app.get('/api/readiness')
 def readiness():
- configured=bool(os.getenv('PAYPAL_CLIENT_ID') and os.getenv('PAYPAL_CLIENT_SECRET'));connectors=authorized_connectors();return {'discovery':True,'auto_scan_minutes':30,'authorized_auto_claim_sources':len(connectors),'provider_connected':configured,'paypal_mode':os.getenv('PAYPAL_MODE','sandbox'),'message':'โหมดส่วนตัว: AI จะกดรับภายในแอปทันทีสำหรับแหล่งที่อนุญาตระบบอัตโนมัติ'}
+ configured=bool(os.getenv('PAYPAL_CLIENT_ID') and os.getenv('PAYPAL_CLIENT_SECRET'));connectors=authorized_connectors();return {'discovery':True,'scope':'Worldwide','target_country':TARGET_COUNTRY,'auto_scan_minutes':30,'auto_claim_enabled':AUTO_CLAIM_ENABLED,'authorized_auto_claim_sources':len(connectors),'provider_connected':configured,'paypal_mode':os.getenv('PAYPAL_MODE','sandbox'),'message':'Worldwide Hunter: ค้นหาทั่วโลกและรับอัตโนมัติเมื่อมีสิทธิ์และแหล่งอนุญาต'}
 @app.get('/health')
-def health():return {'ok':True,'service':'money-hunter-ai','version':'11.1'}
+def health():return {'ok':True,'service':'money-hunter-ai','version':'11.2'}
 
-HTML='''<!doctype html><html lang="th"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Money Hunter AI</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f6f7fb;margin:0;color:#18202a}.wrap{max-width:920px;margin:auto;padding:20px}.hero{background:#111827;color:#fff;border-radius:24px;padding:24px}.money{font-size:42px;font-weight:800;margin:8px 0}.btn{border:0;border-radius:14px;padding:14px 18px;font-size:16px;font-weight:700;cursor:pointer}.primary{background:#22c55e;color:#06240f;width:100%;margin-top:14px}.secondary{background:#e5e7eb;color:#111827;width:100%;margin-top:10px}.claim{background:#16a34a;color:white;margin-top:8px}.disabled{background:#e5e7eb;color:#6b7280;margin-top:8px;cursor:not-allowed}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:14px}.card{background:#fff;border-radius:18px;padding:16px;box-shadow:0 4px 18px #0000000d}.n{font-size:28px;font-weight:800}.deal{margin-top:10px;border-top:1px solid #eee;padding-top:12px}.tag{display:inline-block;background:#eef2ff;padding:5px 9px;border-radius:999px;font-size:12px;margin-right:4px}.ok{background:#dcfce7}.warn{background:#fef3c7}.bad{background:#fee2e2}.muted{color:#6b7280;font-size:13px}.note{background:#ecfdf5;border-radius:14px;padding:12px;margin-top:12px}.msg{font-size:13px;margin-top:6px}@media(max-width:700px){.grid{grid-template-columns:1fr 1fr}}</style></head><body><div class=wrap><div class=hero><b>Money Hunter AI — รับสิทธิ์ในแอป</b><div class=muted style="color:#cbd5e1">AI ค้นหา คัดกรอง และกดรับให้อัตโนมัติเมื่อแหล่งต้นทางอนุญาต</div><div class=money id=money>฿0.00</div><div>เงินจริงที่ยืนยันแล้ว</div><button id=scanBtn class="btn primary" onclick="scan()">ค้นหา + ให้ AI รับรายการที่รับได้</button><button id=allBtn class="btn secondary" onclick="claimAll()">รับสิทธิ์ที่พร้อมทั้งหมด</button><button id=paypalBtn class="btn secondary" onclick="testPaypal()">ทดสอบ PayPal Sandbox</button></div><div class=grid><div class=card><div class=muted>พบทั้งหมด</div><div class=n id=total>0</div></div><div class=card><div class=muted>เข้าเงื่อนไข</div><div class=n id=eligible>0</div></div><div class=card><div class=muted>ของฟรีแบบง่าย</div><div class=n id=simple>0</div></div><div class=card><div class=muted>ต้องตรวจเพิ่ม</div><div class=n id=review>0</div></div></div><div class=card style="margin-top:14px"><b>สถานะระบบ</b><div id=ready class=muted>กำลังตรวจ...</div><div id=paypal class=muted style="margin-top:5px"></div><div class=note>คุณไม่ต้องเปิดลิงก์สำหรับรายการที่รองรับการรับอัตโนมัติ ระบบจะส่งคำขอจากในแอปเอง หากแหล่งนั้นไม่อนุญาตบอทหรือจำเป็นต้อง CAPTCHA/OTP ระบบจะไม่พยายามหลบข้อจำกัด</div></div><div class=card style="margin-top:14px"><b>รายการที่พบ</b><div id=deals></div></div></div><script>function esc(s){return String(s||'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]))}async function load(){let w=await fetch('/api/wallet').then(r=>r.json());money.textContent='฿'+Number(w.confirmed_thb||0).toLocaleString('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2});let rs=await fetch('/api/readiness').then(r=>r.json());ready.textContent=rs.message+' • แหล่งรับอัตโนมัติ: '+rs.authorized_auto_claim_sources;let ps=await fetch('/api/paypal/status').then(r=>r.json());paypal.textContent=ps.configured?'PayPal: เชื่อมไว้แล้ว ('+ps.mode+')':'PayPal: ยังตั้งค่าไม่ครบ';let st=await fetch('/api/stats').then(r=>r.json());total.textContent=st.total;eligible.textContent=st.eligible;simple.textContent=st.simple;review.textContent=st.review;let ds=await fetch('/api/deals').then(r=>r.json());deals.innerHTML=ds.slice(0,40).map(d=>{let ec=d.eligibility==='eligible'?'ok':d.eligibility==='review'?'warn':'bad';let action=d.auto_claimable?`<button class="btn claim" onclick="claimOne(${d.id},this)">AI รับให้เลย</button>`:`<button class="btn disabled" disabled>ยังรับอัตโนมัติไม่ได้</button>`;return `<div class=deal><span class=tag>${esc(d.kind)}</span><span class="tag ${ec}">${esc(d.eligibility)}</span>${d.simple_offer?'<span class="tag ok">ของฟรีแบบง่าย</span>':''}<div><b>${esc(d.title)}</b></div><div class=muted>${esc(d.source)} · ${esc(d.country)} · ${esc(d.eligibility_reason)}</div><div class=muted>สถานะ: ${esc(d.claim_status)}</div>${action}<div class=msg id="m${d.id}"></div></div>`}).join('')||'<div class=muted style="margin-top:10px">ยังไม่มีรายการ</div>'}async function scan(){scanBtn.disabled=true;scanBtn.textContent='กำลังค้นหาและรับสิทธิ์...';await fetch('/api/search');await load();scanBtn.disabled=false;scanBtn.textContent='ค้นหา + ให้ AI รับรายการที่รับได้'}async function claimOne(id,b){b.disabled=true;b.textContent='AI กำลังรับ...';let r=await fetch('/api/claim/'+id,{method:'POST'}).then(r=>r.json());document.getElementById('m'+id).textContent=r.message+(r.ok?' ✅':'');await load()}async function claimAll(){allBtn.disabled=true;allBtn.textContent='AI กำลังรับทั้งหมด...';let r=await fetch('/api/claim-all',{method:'POST'}).then(r=>r.json());allBtn.textContent='ดำเนินการ '+r.attempted+' รายการ';await load();setTimeout(()=>allBtn.textContent='รับสิทธิ์ที่พร้อมทั้งหมด',2000);allBtn.disabled=false}async function testPaypal(){paypalBtn.disabled=true;paypalBtn.textContent='กำลังทดสอบ...';let r=await fetch('/api/paypal/test').then(r=>r.json());paypal.textContent=r.message+(r.ok?' ✅':' ❌');paypalBtn.disabled=false;paypalBtn.textContent='ทดสอบ PayPal Sandbox'}load()</script></body></html>'''
+HTML='''<!doctype html><html lang="th"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Money Hunter AI</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f6f7fb;margin:0;color:#18202a}.wrap{max-width:980px;margin:auto;padding:20px}.hero{background:#111827;color:#fff;border-radius:24px;padding:24px}.money{font-size:42px;font-weight:800;margin:8px 0}.btn{border:0;border-radius:14px;padding:14px 18px;font-size:16px;font-weight:700;cursor:pointer}.primary{background:#22c55e;color:#06240f;width:100%;margin-top:14px}.secondary{background:#e5e7eb;color:#111827;width:100%;margin-top:10px}.claim{background:#16a34a;color:#fff;margin-top:8px}.disabled{background:#e5e7eb;color:#6b7280;margin-top:8px;cursor:not-allowed}.grid{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-top:14px}.card{background:#fff;border-radius:18px;padding:16px;box-shadow:0 4px 18px #0000000d}.n{font-size:28px;font-weight:800}.deal{margin-top:10px;border-top:1px solid #eee;padding-top:12px}.tag{display:inline-block;background:#eef2ff;padding:5px 9px;border-radius:999px;font-size:12px;margin-right:4px}.ok{background:#dcfce7}.warn{background:#fef3c7}.regional{background:#e0e7ff}.muted{color:#6b7280;font-size:13px}.note{background:#ecfdf5;border-radius:14px;padding:12px;margin-top:12px}.msg{font-size:13px;margin-top:6px}@media(max-width:760px){.grid{grid-template-columns:1fr 1fr}}</style></head><body><div class=wrap><div class=hero><b>🌍 Money Hunter AI — Worldwide Hunter</b><div class=muted style="color:#cbd5e1">ค้นหาทั่วโลกทุก 30 นาที • รับอัตโนมัติเมื่อคุณมีสิทธิ์และแหล่งอนุญาต</div><div class=money id=money>฿0.00</div><div>เงินจริงที่ยืนยันแล้ว</div><button id=scanBtn class="btn primary" onclick="scan()">🌍 ค้นหาทั่วโลก + AI รับรายการที่รับได้</button><button id=allBtn class="btn secondary" onclick="claimAll()">⚡ รับสิทธิ์ที่พร้อมทั้งหมด</button><button id=paypalBtn class="btn secondary" onclick="testPaypal()">ทดสอบ PayPal Sandbox</button></div><div class=grid><div class=card><div class=muted>พบทั่วโลก</div><div class=n id=total>0</div></div><div class=card><div class=muted>รับได้จากไทย/Global</div><div class=n id=eligible>0</div></div><div class=card><div class=muted>จำกัดภูมิภาค</div><div class=n id=regional>0</div></div><div class=card><div class=muted>ของฟรีแบบง่าย</div><div class=n id=simple>0</div></div><div class=card><div class=muted>ต้องตรวจเพิ่ม</div><div class=n id=review>0</div></div></div><div class=card style="margin-top:14px"><b>สถานะระบบ</b><div id=ready class=muted>กำลังตรวจ...</div><div id=paypal class=muted style="margin-top:5px"></div><div class=note>AI จะค้นหาทั่วโลก แต่จะไม่อ้างสิทธิ์แทนคุณในประเทศที่คุณไม่มีสิทธิ์ และจะไม่หลบ CAPTCHA/OTP/ข้อห้ามบอท รายการที่มี API หรือ automation ที่ได้รับอนุญาตจะกดรับจากในแอปได้ทันที</div></div><div class=card style="margin-top:14px"><b>รายการทั่วโลกที่พบ</b><div id=deals></div></div></div><script>function esc(s){return String(s||'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]))}async function load(){let w=await fetch('/api/wallet').then(r=>r.json());money.textContent='฿'+Number(w.confirmed_thb||0).toLocaleString('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2});let rs=await fetch('/api/readiness').then(r=>r.json());ready.textContent=rs.message+' • ประเทศผู้ใช้: '+rs.target_country+' • แหล่งรับอัตโนมัติ: '+rs.authorized_auto_claim_sources;let ps=await fetch('/api/paypal/status').then(r=>r.json());paypal.textContent=ps.configured?'PayPal: เชื่อมไว้แล้ว ('+ps.mode+')':'PayPal: ยังตั้งค่าไม่ครบ';let st=await fetch('/api/stats').then(r=>r.json());total.textContent=st.total;eligible.textContent=st.eligible;regional.textContent=st.regional;simple.textContent=st.simple;review.textContent=st.review;let ds=await fetch('/api/deals').then(r=>r.json());deals.innerHTML=ds.slice(0,80).map(d=>{let ec=d.eligibility==='eligible'?'ok':d.eligibility==='regional'?'regional':'warn';let action=d.auto_claimable?`<button class="btn claim" onclick="claimOne(${d.id},this)">AI รับให้เลย</button>`:`<button class="btn disabled" disabled>${d.eligibility==='regional'?'ไม่มีสิทธิ์ตามภูมิภาค':'ยังรับอัตโนมัติไม่ได้'}</button>`;return `<div class=deal><span class=tag>${esc(d.kind)}</span><span class="tag ${ec}">${esc(d.eligibility)}</span>${d.simple_offer?'<span class="tag ok">พร้อมรับ</span>':''}<div><b>${esc(d.title)}</b></div><div class=muted>${esc(d.source)} · ${esc(d.country)} · ${esc(d.eligibility_reason)}</div><div class=muted>สถานะ: ${esc(d.claim_status)}</div>${action}<div class=msg id="m${d.id}"></div></div>`}).join('')||'<div class=muted style="margin-top:10px">ยังไม่มีรายการ</div>'}async function scan(){scanBtn.disabled=true;scanBtn.textContent='กำลังค้นทั่วโลกและรับสิทธิ์...';await fetch('/api/search');await load();scanBtn.disabled=false;scanBtn.textContent='🌍 ค้นหาทั่วโลก + AI รับรายการที่รับได้'}async function claimOne(id,b){b.disabled=true;b.textContent='AI กำลังรับ...';let r=await fetch('/api/claim/'+id,{method:'POST'}).then(r=>r.json());document.getElementById('m'+id).textContent=r.message+(r.ok?' ✅':'');await load()}async function claimAll(){allBtn.disabled=true;allBtn.textContent='AI กำลังรับทั้งหมด...';let r=await fetch('/api/claim-all',{method:'POST'}).then(r=>r.json());allBtn.textContent='ดำเนินการ '+r.attempted+' รายการ';await load();setTimeout(()=>allBtn.textContent='⚡ รับสิทธิ์ที่พร้อมทั้งหมด',2000);allBtn.disabled=false}async function testPaypal(){paypalBtn.disabled=true;paypalBtn.textContent='กำลังทดสอบ...';let r=await fetch('/api/paypal/test').then(r=>r.json());paypal.textContent=r.message+(r.ok?' ✅':' ❌');paypalBtn.disabled=false;paypalBtn.textContent='ทดสอบ PayPal Sandbox'}load()</script></body></html>'''
 @app.get('/',response_class=HTMLResponse)
 def home():return HTML
