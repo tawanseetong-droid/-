@@ -1,4 +1,5 @@
 import os
+import sys
 import httpx
 from fastapi import APIRouter
 
@@ -60,8 +61,12 @@ async def test_paypal_credentials():
 @router.on_event("startup")
 async def paypal_startup_check():
     result = await test_paypal_credentials()
-    # Intentionally log only a safe result; never log credentials or access tokens.
-    print(f"PAYPAL_STARTUP_CHECK ok={result.get('ok')} mode={result.get('mode')} status={result.get('status_code', 'oauth-ok' if result.get('ok') else 'n/a')}")
+    status = result.get("status_code", "oauth-ok" if result.get("ok") else "n/a")
+    print(
+        f"PAYPAL_STARTUP_CHECK ok={result.get('ok')} mode={result.get('mode')} status={status}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 @router.get("/api/paypal/status")
