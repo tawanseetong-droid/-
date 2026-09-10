@@ -9,180 +9,167 @@ from app.paypal import router as paypal_router
 BASE=os.path.dirname(os.path.dirname(__file__))
 DB=os.getenv('DB_PATH',os.path.join(BASE,'money_hunter.db'))
 TARGET_COUNTRY=os.getenv('TARGET_COUNTRY','Thailand').strip() or 'Thailand'
-DISCOVERY_SCOPE=os.getenv('DISCOVERY_SCOPE','worldwide').strip().lower()
 AUTO_CLAIM_ENABLED=os.getenv('AUTO_CLAIM_ENABLED','true').strip().lower()=='true'
-app=FastAPI(title='Money Hunter AI Cloud',version='11.2')
+app=FastAPI(title='Money Hunter AI Cloud',version='12.0')
 app.include_router(paypal_router)
 
-# Worldwide public discovery feeds. Failures of individual feeds are ignored safely.
-SOURCES=[
- ('Reddit Freebies','https://www.reddit.com/r/freebies/.rss'),
- ('GameDeals Free','https://www.reddit.com/r/GameDeals/search.rss?q=free&restrict_sr=1&sort=new'),
- ('FreeGameFindings','https://www.reddit.com/r/FreeGameFindings/.rss'),
- ('Freebies UK','https://www.reddit.com/r/freebiesUK/.rss'),
- ('Freebies Canada','https://www.reddit.com/r/freebiescanada/.rss'),
- ('Freebies India','https://www.reddit.com/r/FreebiesIndia/.rss'),
-]
-KEYS=['free','freebie','giveaway','coupon','voucher','cashback','rebate','grant','sample','100% off','แจกฟรี','คูปอง','เงินคืน','ของฟรี']
+GAMERPOWER_API='https://www.gamerpower.com/api/giveaways?sort-by=date'
+RSS_SOURCES=[('Reddit Freebies','https://www.reddit.com/r/freebies/.rss')]
 SCAM=['seed phrase','private key','otp','gift card payment','pay a fee to receive','advance fee','wire money','โอนเงินก่อน','รหัส otp']
-PURCHASE_WORDS=['purchase required','with purchase','buy one','spend $','minimum spend','order required','ต้องซื้อ','ยอดซื้อ','ซื้อครบ']
-CARD_WORDS=['credit card required','debit card required','card required','บัตรเครดิต','บัตรเดบิต']
-SUBSCRIPTION_WORDS=['subscription required','subscribe and save','paid membership','trial converts','สมาชิกแบบเสียเงิน']
-SURVEY_WORDS=['complete a survey','survey required','ทำแบบสอบถาม']
-REFERRAL_WORDS=['refer a friend','referral required','invite friends','ชวนเพื่อน']
-WORLD_HINTS=['worldwide','global','international','available everywhere','ทั่วโลก','region free','region-free']
-THAI_HINTS=['thailand','thai only','ประเทศไทย','กรุงเทพ','bangkok','.th']
-REGION_HINTS={
- 'United States':['us only','u.s. only','usa only','united states only','united states residents','u.s. residents'],
- 'United Kingdom':['uk only','united kingdom only','uk residents'],
- 'Canada':['canada only','canadian residents'],
- 'Australia':['australia only','australian residents'],
- 'India':['india only','indian residents'],
-}
+PURCHASE=['purchase required','with purchase','buy one','minimum spend','order required','ต้องซื้อ','ยอดซื้อ','ซื้อครบ']
+CARD=['credit card required','debit card required','card required','บัตรเครดิต','บัตรเดบิต']
+SUBS=['subscription required','paid membership','trial converts','สมาชิกแบบเสียเงิน']
+SURVEY=['complete a survey','survey required','ทำแบบสอบถาม']
+REFERRAL=['refer a friend','referral required','invite friends','ชวนเพื่อน']
+WORLD=['worldwide','global','international','region free','region-free','available in most countries','ทั่วโลก']
+THAI=['thailand','ประเทศไทย','bangkok','กรุงเทพ','.th']
+REGIONS={'United States':['us only','u.s. only','usa only','united states only','u.s. residents'],'United Kingdom':['uk only','united kingdom only','uk residents'],'Canada':['canada only','canadian residents'],'Australia':['australia only','australian residents'],'India':['india only','indian residents']}
+
 
 def conn():
- c=sqlite3.connect(DB,timeout=15);c.row_factory=sqlite3.Row;return c
+ c=sqlite3.connect(DB,timeout=20);c.row_factory=sqlite3.Row;return c
 
-def col_exists(c,table,col):return any(r[1]==col for r in c.execute(f'PRAGMA table_info({table})'))
+def has_col(c,t,n):return any(r[1]==n for r in c.execute(f'PRAGMA table_info({t})'))
 
 def init_db():
  c=conn();c.execute('CREATE TABLE IF NOT EXISTS deals(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT,url TEXT UNIQUE,source TEXT,kind TEXT,risk TEXT,country TEXT,created_at TEXT)')
- for name,typ,default in [('eligibility','TEXT',"'review'"),('eligibility_reason','TEXT',"''"),('simple_offer','INTEGER','0'),('requires_purchase','INTEGER','0'),('requires_card','INTEGER','0'),('requires_subscription','INTEGER','0'),('requires_survey','INTEGER','0'),('requires_referral','INTEGER','0'),('claim_mode','TEXT',"'manual'"),('claim_status','TEXT',"'new'")]:
-  if not col_exists(c,'deals',name):c.execute(f'ALTER TABLE deals ADD COLUMN {name} {typ} DEFAULT {default}')
+ cols=[('eligibility','TEXT',"'review'"),('eligibility_reason','TEXT',"''"),('simple_offer','INTEGER','0'),('requires_purchase','INTEGER','0'),('requires_card','INTEGER','0'),('requires_subscription','INTEGER','0'),('requires_survey','INTEGER','0'),('requires_referral','INTEGER','0'),('claim_mode','TEXT',"'manual'"),('claim_status','TEXT',"'new'"),('description','TEXT',"''"),('instructions','TEXT',"''"),('end_date','TEXT',"''"),('worth','TEXT',"''"),('platforms','TEXT',"''")]
+ for n,t,d in cols:
+  if not has_col(c,'deals',n):c.execute(f'ALTER TABLE deals ADD COLUMN {n} {t} DEFAULT {d}')
  c.execute('CREATE TABLE IF NOT EXISTS ledger(id INTEGER PRIMARY KEY AUTOINCREMENT,amount REAL,currency TEXT,status TEXT,reference TEXT,created_at TEXT)')
  c.execute('CREATE TABLE IF NOT EXISTS claim_log(id INTEGER PRIMARY KEY AUTOINCREMENT,deal_id INTEGER,status TEXT,message TEXT,created_at TEXT)')
+ c.execute('CREATE TABLE IF NOT EXISTS source_health(source TEXT PRIMARY KEY,status TEXT,message TEXT,checked_at TEXT,found INTEGER DEFAULT 0)')
  c.commit();c.close()
 init_db()
 
-def txt(s):return ' '.join(BeautifulSoup(s or '','html.parser').get_text(' ',strip=True).split())
-def kind(t):
- x=t.lower()
- if 'cashback' in x or 'rebate' in x or 'เงินคืน' in x:return 'Cashback'
- if 'coupon' in x or 'voucher' in x or 'คูปอง' in x:return 'Coupon'
- if 'grant' in x:return 'Grant'
- if 'giveaway' in x or 'แจกฟรี' in x:return 'Giveaway'
- if 'sample' in x:return 'Free Sample'
- if '100% off' in x:return '100% Off'
- return 'Freebie'
-def risk(t):return 'high' if any(k in t.lower() for k in SCAM) else 'low'
 
-def detected_region(x):
- for region,hints in REGION_HINTS.items():
-  if any(k in x for k in hints):return region
+def clean(s):return ' '.join(BeautifulSoup(str(s or ''),'html.parser').get_text(' ',strip=True).split())
+def detect_region(x):
+ for r,h in REGIONS.items():
+  if any(k in x for k in h):return r
  return None
 
-def classify(text):
- x=text.lower();rp=any(k in x for k in PURCHASE_WORDS);rc=any(k in x for k in CARD_WORDS);rs=any(k in x for k in SUBSCRIPTION_WORDS);rv=any(k in x for k in SURVEY_WORDS);rr=any(k in x for k in REFERRAL_WORDS);complex_req=rp or rc or rs or rv or rr
- region=detected_region(x)
- target=TARGET_COUNTRY.lower()
- if any(k in x for k in WORLD_HINTS):elig='eligible';reason='ระบุว่าใช้ได้ทั่วโลก/ไม่มีข้อจำกัดภูมิภาค'
- elif any(k in x for k in THAI_HINTS):elig='eligible';reason='พบข้อความรองรับประเทศไทย'
- elif region:
-  elig='eligible' if region.lower()==target else 'regional'
-  reason=f'จำกัดภูมิภาค: {region}'
- else:elig='review';reason='ค้นพบจากโหมดทั่วโลก แต่ยังต้องยืนยันประเทศ/เงื่อนไขก่อนรับ'
- simple=(elig=='eligible' and not complex_req)
- return elig,reason,int(simple),int(rp),int(rc),int(rs),int(rv),int(rr)
+def classify(text,source=''):
+ x=text.lower();rp=any(k in x for k in PURCHASE);rc=any(k in x for k in CARD);rs=any(k in x for k in SUBS);rv=any(k in x for k in SURVEY);rr=any(k in x for k in REFERRAL);complex_req=rp or rc or rs or rv or rr
+ region=detect_region(x)
+ if any(k in x for k in THAI):elig='eligible';reason='พบข้อความรองรับประเทศไทย';country='Thailand'
+ elif any(k in x for k in WORLD):elig='eligible';reason='พบข้อความระบุว่ากว้างหลายประเทศ/ทั่วโลก';country='Worldwide'
+ elif region:elig='regional';reason=f'จำกัดภูมิภาค: {region}';country=region
+ elif source=='GamerPower':elig='review';reason='GamerPower คัดรายการที่เปิดอยู่และโดยทั่วไปเข้าถึงได้หลายประเทศ แต่ต้องเช็กภูมิภาคของรายการ';country='Global candidate'
+ else:elig='review';reason='ยังไม่พบข้อความยืนยันประเทศ';country='Unknown'
+ simple=int(not complex_req and elig in ('eligible','review'))
+ return elig,reason,country,simple,int(rp),int(rc),int(rs),int(rv),int(rr)
 
-def country_from(text,elig):
- x=text.lower();region=detected_region(x)
- if any(k in x for k in WORLD_HINTS):return 'Worldwide'
- if any(k in x for k in THAI_HINTS):return 'Thailand'
- if region:return region
- return 'Unknown/Global check'
+def risk(text):return 'high' if any(k in text.lower() for k in SCAM) else 'low'
+
+def upsert_health(source,status,message,found=0):
+ c=conn();c.execute('INSERT INTO source_health(source,status,message,checked_at,found) VALUES(?,?,?,?,?) ON CONFLICT(source) DO UPDATE SET status=excluded.status,message=excluded.message,checked_at=excluded.checked_at,found=excluded.found',(source,status,message,datetime.now(timezone.utc).isoformat(),found));c.commit();c.close()
+
+async def scan_gamerpower(client):
+ try:
+  r=await client.get(GAMERPOWER_API);r.raise_for_status();data=r.json()
+  if not isinstance(data,list):data=[]
+  added=0
+  for g in data[:250]:
+   title=clean(g.get('title'));desc=clean(g.get('description'));inst=clean(g.get('instructions'));url=g.get('open_giveaway_url') or g.get('gamerpower_url') or ''
+   if not title or not url:continue
+   text=' '.join([title,desc,inst,clean(g.get('platforms')),clean(g.get('type'))])
+   elig,reason,country,simple,rp,rc,rs,rv,rr=classify(text,'GamerPower');rk=risk(text)
+   c=conn();cur=c.execute('''INSERT OR IGNORE INTO deals(title,url,source,kind,risk,country,created_at,eligibility,eligibility_reason,simple_offer,requires_purchase,requires_card,requires_subscription,requires_survey,requires_referral,claim_mode,claim_status,description,instructions,end_date,worth,platforms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(title[:300],url,'GamerPower',clean(g.get('type') or 'Giveaway'),rk,country,datetime.now(timezone.utc).isoformat(),elig,reason,simple,rp,rc,rs,rv,rr,'manual','ready' if simple and rk!='high' else 'new',desc[:2000],inst[:2000],clean(g.get('end_date')),clean(g.get('worth')),clean(g.get('platforms'))));added+=max(cur.rowcount,0);c.commit();c.close()
+  upsert_health('GamerPower','ok','API ใช้งานได้',len(data));return added,len(data)
+ except Exception as e:
+  upsert_health('GamerPower','error',type(e).__name__,0);return 0,0
+
+async def scan_rss(client,name,url):
+ try:
+  r=await client.get(url);r.raise_for_status();root=ET.fromstring(r.content);found=added=0
+  for e in root.iter():
+   if e.tag.split('}')[-1].lower() not in ('item','entry'):continue
+   title=summary=link=''
+   for ch in list(e):
+    n=ch.tag.split('}')[-1].lower()
+    if n=='title' and not title:title=''.join(ch.itertext()).strip()
+    elif n in ('summary','description','content') and not summary:summary=' '.join(''.join(ch.itertext()).split())
+    elif n=='link' and not link:link=(ch.attrib.get('href') or (ch.text or '')).strip()
+   text=clean(title+' '+summary)
+   if not title or not any(k in text.lower() for k in ['free','giveaway','sample','coupon','cashback','rebate']):continue
+   found+=1;elig,reason,country,simple,rp,rc,rs,rv,rr=classify(text,name);rk=risk(text)
+   c=conn();cur=c.execute('''INSERT OR IGNORE INTO deals(title,url,source,kind,risk,country,created_at,eligibility,eligibility_reason,simple_offer,requires_purchase,requires_card,requires_subscription,requires_survey,requires_referral,claim_mode,claim_status,description) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(clean(title)[:300],link or url,name,'Freebie',rk,country,datetime.now(timezone.utc).isoformat(),elig,reason,simple,rp,rc,rs,rv,rr,'manual','ready' if simple and rk!='high' else 'new',clean(summary)[:2000]));added+=max(cur.rowcount,0);c.commit();c.close()
+  upsert_health(name,'ok','RSS ใช้งานได้',found);return added,found
+ except Exception as e:
+  upsert_health(name,'error',type(e).__name__,0);return 0,0
 
 async def scan_once():
- added=0
- async with httpx.AsyncClient(headers={'User-Agent':'MoneyHunterAI/11.2 personal-use worldwide'},follow_redirects=True,timeout=20) as client:
-  for name,url in SOURCES:
-   try:
-    r=await client.get(url);r.raise_for_status();root=ET.fromstring(r.content)
-    for e in root.iter():
-     if e.tag.split('}')[-1].lower() not in ('item','entry'):continue
-     title=summary=link=''
-     for ch in list(e):
-      n=ch.tag.split('}')[-1].lower()
-      if n=='title' and not title:title=''.join(ch.itertext()).strip()
-      elif n in ('summary','description','content') and not summary:summary=' '.join(''.join(ch.itertext()).split())
-      elif n=='link' and not link:link=(ch.attrib.get('href') or (ch.text or '')).strip()
-     text=txt(title+' '+summary)
-     if not title or not any(k in text.lower() for k in KEYS):continue
-     rk=risk(text);elig,reason,simple,rp,rc,rs,rv,rr=classify(text);ctry=country_from(text,elig)
-     c=conn();cur=c.execute('''INSERT OR IGNORE INTO deals(title,url,source,kind,risk,country,created_at,eligibility,eligibility_reason,simple_offer,requires_purchase,requires_card,requires_subscription,requires_survey,requires_referral,claim_mode,claim_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(txt(title)[:300],link or url,name,kind(text),rk,ctry,datetime.now(timezone.utc).isoformat(),elig,reason,simple,rp,rc,rs,rv,rr,'manual','ready' if simple and rk!='high' else 'new'));added+=cur.rowcount if cur.rowcount>0 else 0;c.commit();c.close()
-   except Exception as exc:print('scan source error',name,type(exc).__name__)
- return added
-
-def reclassify_existing():
- c=conn();rows=c.execute('SELECT id,title,country FROM deals').fetchall()
- for r in rows:
-  text=(r['title'] or '')+' '+(r['country'] or '');elig,reason,simple,rp,rc,rs,rv,rr=classify(text);c.execute('UPDATE deals SET eligibility=?,eligibility_reason=?,simple_offer=?,requires_purchase=?,requires_card=?,requires_subscription=?,requires_survey=?,requires_referral=?,claim_status=? WHERE id=?',(elig,reason,simple,rp,rc,rs,rv,rr,'ready' if simple else 'new',r['id']))
- c.commit();c.close()
-reclassify_existing()
+ async with httpx.AsyncClient(headers={'User-Agent':'MoneyHunterAI/12.0 personal-use'},follow_redirects=True,timeout=20) as client:
+  a,total=await scan_gamerpower(client)
+  for n,u in RSS_SOURCES:
+   x,y=await scan_rss(client,n,u);a+=x;total+=y
+  return {'added':a,'found':total}
 
 def authorized_connectors():
  try:return json.loads(os.getenv('AUTHORIZED_CLAIM_CONNECTORS','{}'))
  except Exception:return {}
 
 def auto_claimable(d):
- cfg=authorized_connectors().get(d['source']);return bool(AUTO_CLAIM_ENABLED and d.get('simple_offer') and d.get('eligibility')=='eligible' and d.get('risk')!='high' and isinstance(cfg,dict) and cfg.get('endpoint') and cfg.get('automation_permitted'))
+ cfg=authorized_connectors().get(d['source']);return bool(AUTO_CLAIM_ENABLED and d.get('simple_offer') and d.get('risk')!='high' and d.get('eligibility')=='eligible' and isinstance(cfg,dict) and cfg.get('endpoint') and cfg.get('automation_permitted'))
 
 async def claim_one(d):
  if not d:return {'ok':False,'message':'ไม่พบรายการ'}
- if not AUTO_CLAIM_ENABLED:return {'ok':False,'message':'โหมดรับอัตโนมัติถูกปิด'}
- if d['risk']=='high' or not d['simple_offer'] or d['eligibility']!='eligible':return {'ok':False,'message':'รายการนี้ยังไม่ผ่านเงื่อนไขรับอัตโนมัติ'}
- cfg=authorized_connectors().get(d['source'])
- if not isinstance(cfg,dict) or not cfg.get('endpoint') or not cfg.get('automation_permitted'):
-  return {'ok':False,'needs_user':True,'message':'ยังไม่มีช่องทาง API/automation ที่เจ้าของแหล่งอนุญาต'}
- headers={'User-Agent':'MoneyHunterAI/11.2'};token_env=cfg.get('token_env')
- if token_env and os.getenv(token_env):headers['Authorization']='Bearer '+os.getenv(token_env)
+ if not auto_claimable(d):return {'ok':False,'needs_user':True,'message':'รายการนี้ค้นพบจริง แต่แหล่งต้นทางยังไม่มี API ที่อนุญาตให้บอทกดรับแทน'}
+ cfg=authorized_connectors()[d['source']];headers={'User-Agent':'MoneyHunterAI/12.0'};te=cfg.get('token_env')
+ if te and os.getenv(te):headers['Authorization']='Bearer '+os.getenv(te)
  try:
-  async with httpx.AsyncClient(timeout=20,follow_redirects=False) as client:res=await client.post(cfg['endpoint'],json={'offer_url':d['url'],'offer_title':d['title'],'target_country':TARGET_COUNTRY},headers=headers)
-  status='submitted' if 200<=res.status_code<300 else 'failed';msg='ส่งคำขอรับสิทธิ์อัตโนมัติแล้ว' if status=='submitted' else f'ผู้ให้บริการตอบ HTTP {res.status_code}'
- except Exception as exc:status='failed';msg=f'เชื่อมต่อแหล่งรับสิทธิ์ไม่สำเร็จ: {type(exc).__name__}'
- c=conn();c.execute('UPDATE deals SET claim_status=?,claim_mode=? WHERE id=?',(status,'authorized_api',d['id']));c.execute('INSERT INTO claim_log(deal_id,status,message,created_at) VALUES(?,?,?,?)',(d['id'],status,msg,datetime.now(timezone.utc).isoformat()));c.commit();c.close();return {'ok':status=='submitted','status':status,'message':msg}
+  async with httpx.AsyncClient(timeout=20,follow_redirects=False) as client:r=await client.post(cfg['endpoint'],json={'offer_url':d['url'],'offer_title':d['title'],'target_country':TARGET_COUNTRY},headers=headers)
+  ok=200<=r.status_code<300;status='submitted' if ok else 'failed';msg='ส่งคำขอรับสิทธิ์แล้ว' if ok else f'ผู้ให้บริการตอบ HTTP {r.status_code}'
+ except Exception as e:ok=False;status='failed';msg=type(e).__name__
+ c=conn();c.execute('UPDATE deals SET claim_status=?,claim_mode=? WHERE id=?',(status,'authorized_api',d['id']));c.execute('INSERT INTO claim_log(deal_id,status,message,created_at) VALUES(?,?,?,?)',(d['id'],status,msg,datetime.now(timezone.utc).isoformat()));c.commit();c.close();return {'ok':ok,'message':msg}
 
-async def auto_claim_authorized():
- if not AUTO_CLAIM_ENABLED:return 0
- c=conn();rows=[dict(x) for x in c.execute("SELECT * FROM deals WHERE simple_offer=1 AND risk!='high' AND eligibility='eligible' AND claim_status='ready' LIMIT 50")];c.close();done=0
+async def auto_claim_all():
+ c=conn();rows=[dict(x) for x in c.execute("SELECT * FROM deals WHERE claim_status='ready' AND risk!='high' LIMIT 100")];c.close();attempted=0;submitted=0
  for d in rows:
-  if auto_claimable(d):await claim_one(d);done+=1
- return done
+  if auto_claimable(d):
+   attempted+=1;r=await claim_one(d);submitted+=1 if r.get('ok') else 0
+ return attempted,submitted
 
 @app.on_event('startup')
 async def startup():
  async def loop():
-  await asyncio.sleep(3)
+  await asyncio.sleep(2)
   while True:
-   try:await scan_once();await auto_claim_authorized()
-   except Exception as exc:print('background error',type(exc).__name__)
+   try:await scan_once();await auto_claim_all()
+   except Exception as e:print('background',type(e).__name__)
    await asyncio.sleep(1800)
  asyncio.create_task(loop())
 
 @app.get('/api/search')
 async def search():
- a=await scan_once();b=await auto_claim_authorized();return {'ok':True,'scope':DISCOVERY_SCOPE,'added':a,'auto_claim_attempts':b}
+ s=await scan_once();a,b=await auto_claim_all();return {'ok':True,**s,'claim_attempted':a,'claim_submitted':b}
 @app.get('/api/deals')
 def deals():
- c=conn();rows=[dict(x) for x in c.execute("SELECT * FROM deals WHERE risk!='high' ORDER BY simple_offer DESC, CASE eligibility WHEN 'eligible' THEN 0 WHEN 'review' THEN 1 ELSE 2 END, id DESC LIMIT 400")];c.close()
+ c=conn();rows=[dict(x) for x in c.execute("SELECT * FROM deals WHERE risk!='high' ORDER BY CASE source WHEN 'GamerPower' THEN 0 ELSE 1 END, id DESC LIMIT 400")];c.close()
  for d in rows:d['auto_claimable']=auto_claimable(d)
  return rows
 @app.post('/api/claim/{deal_id}')
 async def claim(deal_id:int):
  c=conn();r=c.execute('SELECT * FROM deals WHERE id=?',(deal_id,)).fetchone();c.close();return await claim_one(dict(r) if r else None)
 @app.post('/api/claim-all')
-async def claim_all():return {'ok':True,'attempted':await auto_claim_authorized()}
+async def claim_all():
+ a,b=await auto_claim_all();return {'ok':True,'attempted':a,'submitted':b}
+@app.get('/api/source-health')
+def source_health():
+ c=conn();r=[dict(x) for x in c.execute('SELECT * FROM source_health ORDER BY source')];c.close();return r
 @app.get('/api/stats')
 def stats():
- c=conn();total=c.execute("SELECT COUNT(*) FROM deals WHERE risk!='high'").fetchone()[0];eligible=c.execute("SELECT COUNT(*) FROM deals WHERE risk!='high' AND eligibility='eligible'").fetchone()[0];regional=c.execute("SELECT COUNT(*) FROM deals WHERE risk!='high' AND eligibility='regional'").fetchone()[0];simple=c.execute("SELECT COUNT(*) FROM deals WHERE risk!='high' AND simple_offer=1 AND eligibility='eligible'").fetchone()[0];review=c.execute("SELECT COUNT(*) FROM deals WHERE risk!='high' AND eligibility='review'").fetchone()[0];submitted=c.execute("SELECT COUNT(*) FROM deals WHERE claim_status='submitted'").fetchone()[0];c.close();return {'total':total,'eligible':eligible,'regional':regional,'simple':simple,'review':review,'submitted':submitted}
+ c=conn();total=c.execute("SELECT COUNT(*) FROM deals WHERE risk!='high'").fetchone()[0];gp=c.execute("SELECT COUNT(*) FROM deals WHERE source='GamerPower' AND risk!='high'").fetchone()[0];eligible=c.execute("SELECT COUNT(*) FROM deals WHERE eligibility='eligible' AND risk!='high'").fetchone()[0];ready=c.execute("SELECT COUNT(*) FROM deals WHERE claim_status='ready' AND risk!='high'").fetchone()[0];submitted=c.execute("SELECT COUNT(*) FROM deals WHERE claim_status='submitted'").fetchone()[0];c.close();return {'total':total,'gamerpower':gp,'eligible':eligible,'ready':ready,'submitted':submitted}
 @app.get('/api/wallet')
 def wallet():
- c=conn();rows=[dict(x) for x in c.execute("SELECT * FROM ledger WHERE status='confirmed' ORDER BY id DESC")];c.close();total=sum(float(x['amount']) for x in rows if x['currency'].upper()=='THB');return {'confirmed_thb':round(total,2),'transactions':rows,'note':'นับเฉพาะธุรกรรมที่ผู้ให้บริการยืนยันแล้ว'}
+ c=conn();rows=[dict(x) for x in c.execute("SELECT * FROM ledger WHERE status='confirmed' ORDER BY id DESC")];c.close();total=sum(float(x['amount']) for x in rows if (x['currency'] or '').upper()=='THB');return {'confirmed_thb':round(total,2),'transactions':rows}
 @app.get('/api/readiness')
 def readiness():
- configured=bool(os.getenv('PAYPAL_CLIENT_ID') and os.getenv('PAYPAL_CLIENT_SECRET'));connectors=authorized_connectors();return {'discovery':True,'scope':'Worldwide','target_country':TARGET_COUNTRY,'auto_scan_minutes':30,'auto_claim_enabled':AUTO_CLAIM_ENABLED,'authorized_auto_claim_sources':len(connectors),'provider_connected':configured,'paypal_mode':os.getenv('PAYPAL_MODE','sandbox'),'message':'Worldwide Hunter: ค้นหาทั่วโลกและรับอัตโนมัติเมื่อมีสิทธิ์และแหล่งอนุญาต'}
+ return {'version':'12.0','target_country':TARGET_COUNTRY,'auto_scan_minutes':30,'auto_claim_enabled':AUTO_CLAIM_ENABLED,'authorized_auto_claim_sources':len(authorized_connectors()),'message':'สามมาร: ค้นหา → ตรวจสิทธิ์ → รับอัตโนมัติเมื่อแหล่งอนุญาต API'}
 @app.get('/health')
-def health():return {'ok':True,'service':'money-hunter-ai','version':'11.2'}
+def health():return {'ok':True,'version':'12.0'}
 
-HTML='''<!doctype html><html lang="th"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Money Hunter AI</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f6f7fb;margin:0;color:#18202a}.wrap{max-width:980px;margin:auto;padding:20px}.hero{background:#111827;color:#fff;border-radius:24px;padding:24px}.money{font-size:42px;font-weight:800;margin:8px 0}.btn{border:0;border-radius:14px;padding:14px 18px;font-size:16px;font-weight:700;cursor:pointer}.primary{background:#22c55e;color:#06240f;width:100%;margin-top:14px}.secondary{background:#e5e7eb;color:#111827;width:100%;margin-top:10px}.claim{background:#16a34a;color:#fff;margin-top:8px}.disabled{background:#e5e7eb;color:#6b7280;margin-top:8px;cursor:not-allowed}.grid{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-top:14px}.card{background:#fff;border-radius:18px;padding:16px;box-shadow:0 4px 18px #0000000d}.n{font-size:28px;font-weight:800}.deal{margin-top:10px;border-top:1px solid #eee;padding-top:12px}.tag{display:inline-block;background:#eef2ff;padding:5px 9px;border-radius:999px;font-size:12px;margin-right:4px}.ok{background:#dcfce7}.warn{background:#fef3c7}.regional{background:#e0e7ff}.muted{color:#6b7280;font-size:13px}.note{background:#ecfdf5;border-radius:14px;padding:12px;margin-top:12px}.msg{font-size:13px;margin-top:6px}@media(max-width:760px){.grid{grid-template-columns:1fr 1fr}}</style></head><body><div class=wrap><div class=hero><b>🌍 Money Hunter AI — Worldwide Hunter</b><div class=muted style="color:#cbd5e1">ค้นหาทั่วโลกทุก 30 นาที • รับอัตโนมัติเมื่อคุณมีสิทธิ์และแหล่งอนุญาต</div><div class=money id=money>฿0.00</div><div>เงินจริงที่ยืนยันแล้ว</div><button id=scanBtn class="btn primary" onclick="scan()">🌍 ค้นหาทั่วโลก + AI รับรายการที่รับได้</button><button id=allBtn class="btn secondary" onclick="claimAll()">⚡ รับสิทธิ์ที่พร้อมทั้งหมด</button><button id=paypalBtn class="btn secondary" onclick="testPaypal()">ทดสอบ PayPal Sandbox</button></div><div class=grid><div class=card><div class=muted>พบทั่วโลก</div><div class=n id=total>0</div></div><div class=card><div class=muted>รับได้จากไทย/Global</div><div class=n id=eligible>0</div></div><div class=card><div class=muted>จำกัดภูมิภาค</div><div class=n id=regional>0</div></div><div class=card><div class=muted>ของฟรีแบบง่าย</div><div class=n id=simple>0</div></div><div class=card><div class=muted>ต้องตรวจเพิ่ม</div><div class=n id=review>0</div></div></div><div class=card style="margin-top:14px"><b>สถานะระบบ</b><div id=ready class=muted>กำลังตรวจ...</div><div id=paypal class=muted style="margin-top:5px"></div><div class=note>AI จะค้นหาทั่วโลก แต่จะไม่อ้างสิทธิ์แทนคุณในประเทศที่คุณไม่มีสิทธิ์ และจะไม่หลบ CAPTCHA/OTP/ข้อห้ามบอท รายการที่มี API หรือ automation ที่ได้รับอนุญาตจะกดรับจากในแอปได้ทันที</div></div><div class=card style="margin-top:14px"><b>รายการทั่วโลกที่พบ</b><div id=deals></div></div></div><script>function esc(s){return String(s||'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]))}async function load(){let w=await fetch('/api/wallet').then(r=>r.json());money.textContent='฿'+Number(w.confirmed_thb||0).toLocaleString('th-TH',{minimumFractionDigits:2,maximumFractionDigits:2});let rs=await fetch('/api/readiness').then(r=>r.json());ready.textContent=rs.message+' • ประเทศผู้ใช้: '+rs.target_country+' • แหล่งรับอัตโนมัติ: '+rs.authorized_auto_claim_sources;let ps=await fetch('/api/paypal/status').then(r=>r.json());paypal.textContent=ps.configured?'PayPal: เชื่อมไว้แล้ว ('+ps.mode+')':'PayPal: ยังตั้งค่าไม่ครบ';let st=await fetch('/api/stats').then(r=>r.json());total.textContent=st.total;eligible.textContent=st.eligible;regional.textContent=st.regional;simple.textContent=st.simple;review.textContent=st.review;let ds=await fetch('/api/deals').then(r=>r.json());deals.innerHTML=ds.slice(0,80).map(d=>{let ec=d.eligibility==='eligible'?'ok':d.eligibility==='regional'?'regional':'warn';let action=d.auto_claimable?`<button class="btn claim" onclick="claimOne(${d.id},this)">AI รับให้เลย</button>`:`<button class="btn disabled" disabled>${d.eligibility==='regional'?'ไม่มีสิทธิ์ตามภูมิภาค':'ยังรับอัตโนมัติไม่ได้'}</button>`;return `<div class=deal><span class=tag>${esc(d.kind)}</span><span class="tag ${ec}">${esc(d.eligibility)}</span>${d.simple_offer?'<span class="tag ok">พร้อมรับ</span>':''}<div><b>${esc(d.title)}</b></div><div class=muted>${esc(d.source)} · ${esc(d.country)} · ${esc(d.eligibility_reason)}</div><div class=muted>สถานะ: ${esc(d.claim_status)}</div>${action}<div class=msg id="m${d.id}"></div></div>`}).join('')||'<div class=muted style="margin-top:10px">ยังไม่มีรายการ</div>'}async function scan(){scanBtn.disabled=true;scanBtn.textContent='กำลังค้นทั่วโลกและรับสิทธิ์...';await fetch('/api/search');await load();scanBtn.disabled=false;scanBtn.textContent='🌍 ค้นหาทั่วโลก + AI รับรายการที่รับได้'}async function claimOne(id,b){b.disabled=true;b.textContent='AI กำลังรับ...';let r=await fetch('/api/claim/'+id,{method:'POST'}).then(r=>r.json());document.getElementById('m'+id).textContent=r.message+(r.ok?' ✅':'');await load()}async function claimAll(){allBtn.disabled=true;allBtn.textContent='AI กำลังรับทั้งหมด...';let r=await fetch('/api/claim-all',{method:'POST'}).then(r=>r.json());allBtn.textContent='ดำเนินการ '+r.attempted+' รายการ';await load();setTimeout(()=>allBtn.textContent='⚡ รับสิทธิ์ที่พร้อมทั้งหมด',2000);allBtn.disabled=false}async function testPaypal(){paypalBtn.disabled=true;paypalBtn.textContent='กำลังทดสอบ...';let r=await fetch('/api/paypal/test').then(r=>r.json());paypal.textContent=r.message+(r.ok?' ✅':' ❌');paypalBtn.disabled=false;paypalBtn.textContent='ทดสอบ PayPal Sandbox'}load()</script></body></html>'''
+HTML='''<!doctype html><html lang="th"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Money Hunter AI v12</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f4f6fa;margin:0;color:#172033}.wrap{max-width:980px;margin:auto;padding:20px}.hero{background:#0f172a;color:white;border-radius:24px;padding:24px}.money{font-size:42px;font-weight:800}.btn{border:0;border-radius:13px;padding:13px 16px;font-weight:750;cursor:pointer}.green{background:#22c55e}.gray{background:#e5e7eb}.full{width:100%;margin-top:10px}.grid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-top:12px}.card{background:#fff;border-radius:18px;padding:16px;margin-top:12px;box-shadow:0 4px 18px #0000000a}.n{font-size:26px;font-weight:800}.muted{color:#697386;font-size:13px}.deal{border-top:1px solid #eee;padding:12px 0}.tag{display:inline-block;background:#eef2ff;border-radius:999px;padding:4px 8px;font-size:12px;margin-right:4px}.ok{background:#dcfce7}.warn{background:#fef3c7}.bad{background:#fee2e2}.claim{background:#16a34a;color:#fff;margin-top:7px}.disabled{background:#e5e7eb;color:#667085;margin-top:7px}.agent{background:#f8fafc;border-radius:12px;padding:10px;margin-top:8px}@media(max-width:720px){.grid{grid-template-columns:1fr 1fr}}</style></head><body><div class=wrap><div class=hero><b>Money Hunter AI v12 — สามมาร</b><div class=muted style="color:#cbd5e1">มารค้นหา → มารตรวจ → มารรับ</div><div id=money class=money>฿0.00</div><div>เงินจริงที่ผู้ให้บริการยืนยันแล้ว</div><button id=scan class="btn green full" onclick="go()">🌍 ให้สามมารออกค้นหาทั่วโลกตอนนี้</button><button class="btn gray full" onclick="claimAll()">⚡ รับอัตโนมัติทุกรายการที่ระบบได้รับอนุญาต</button></div><div class=grid><div class=card><div class=muted>พบทั้งหมด</div><div class=n id=total>0</div></div><div class=card><div class=muted>GamerPower</div><div class=n id=gp>0</div></div><div class=card><div class=muted>ผ่านประเทศ</div><div class=n id=eligible>0</div></div><div class=card><div class=muted>คิวพร้อมรับ</div><div class=n id=ready>0</div></div><div class=card><div class=muted>ส่งรับแล้ว</div><div class=n id=submitted>0</div></div></div><div class=card><b>สถานะสามมาร</b><div class=agent id=a1>🔎 มารค้นหา: กำลังตรวจ...</div><div class=agent id=a2>🛡️ มารตรวจ: กำลังตรวจ...</div><div class=agent id=a3>⚡ มารรับ: กำลังตรวจ...</div></div><div class=card><b>รายการฟรีที่พบจริง</b><div id=deals></div></div></div><script>function e(s){return String(s||'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]))}async function load(){let w=await fetch('/api/wallet').then(r=>r.json());money.textContent='฿'+Number(w.confirmed_thb||0).toLocaleString('th-TH',{minimumFractionDigits:2});let st=await fetch('/api/stats').then(r=>r.json());total.textContent=st.total;gp.textContent=st.gamerpower;eligible.textContent=st.eligible;ready.textContent=st.ready;submitted.textContent=st.submitted;let h=await fetch('/api/source-health').then(r=>r.json());let gh=h.find(x=>x.source==='GamerPower');a1.textContent=gh&&gh.status==='ok'?'🔎 มารค้นหา: GamerPower API ใช้งานได้ พบ '+gh.found+' รายการ':'🔎 มารค้นหา: '+(gh?gh.message:'รอรอบค้นหา');a2.textContent='🛡️ มารตรวจ: คัดของเสี่ยงสูง/ต้องซื้อ/จำกัดประเทศก่อนรับ';let rd=await fetch('/api/readiness').then(r=>r.json());a3.textContent='⚡ มารรับ: แหล่ง API ที่อนุญาตให้กดรับอัตโนมัติ '+rd.authorized_auto_claim_sources+' แหล่ง';let ds=await fetch('/api/deals').then(r=>r.json());deals.innerHTML=ds.slice(0,50).map(d=>{let cl=d.eligibility==='eligible'?'ok':d.eligibility==='regional'?'bad':'warn';let b=d.auto_claimable?`<button class="btn claim" onclick="claim(${d.id},this)">AI รับให้เลย</button>`:`<button class="btn disabled" disabled>ค้นพบแล้ว — แหล่งนี้ยังไม่เปิด API ให้กดรับแทน</button>`;return `<div class=deal><span class=tag>${e(d.source)}</span><span class="tag ${cl}">${e(d.eligibility)}</span><div><b>${e(d.title)}</b></div><div class=muted>${e(d.platforms)} ${d.worth?'· มูลค่า '+e(d.worth):''}</div><div class=muted>${e(d.eligibility_reason)}</div>${b}</div>`}).join('')||'<div class=muted>ยังไม่มีรายการ กดค้นหาด้านบน</div>'}async function go(){scan.disabled=true;scan.textContent='สามมารกำลังทำงาน...';let r=await fetch('/api/search').then(r=>r.json());await load();scan.textContent='พบ '+r.found+' รายการ · เพิ่มใหม่ '+r.added+' รายการ';setTimeout(()=>{scan.textContent='🌍 ให้สามมารออกค้นหาทั่วโลกตอนนี้';scan.disabled=false},2500)}async function claim(id,b){b.disabled=true;b.textContent='กำลังรับ...';let r=await fetch('/api/claim/'+id,{method:'POST'}).then(r=>r.json());alert(r.message);await load()}async function claimAll(){let r=await fetch('/api/claim-all',{method:'POST'}).then(r=>r.json());alert('ลองรับ '+r.attempted+' รายการ / ส่งสำเร็จ '+r.submitted+' รายการ');await load()}load()</script></body></html>'''
 @app.get('/',response_class=HTMLResponse)
 def home():return HTML
