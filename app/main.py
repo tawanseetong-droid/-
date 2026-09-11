@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
-import os, sqlite3, asyncio, json
+import os, sqlite3, asyncio, json, re
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 import httpx, xml.etree.ElementTree as ET
@@ -54,7 +54,7 @@ def has_col(c,t,n):return any(r[1]==n for r in c.execute(f'PRAGMA table_info({t}
 
 def init_db():
  c=conn();c.execute('CREATE TABLE IF NOT EXISTS deals(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT,url TEXT UNIQUE,source TEXT,kind TEXT,risk TEXT,country TEXT,created_at TEXT)')
- cols=[('eligibility','TEXT',"'review'"),('eligibility_reason','TEXT',"''"),('simple_offer','INTEGER','0'),('requires_purchase','INTEGER','0'),('requires_card','INTEGER','0'),('requires_subscription','INTEGER','0'),('requires_survey','INTEGER','0'),('requires_referral','INTEGER','0'),('requires_game','INTEGER','0'),('requires_checkin','INTEGER','0'),('offer_mechanic','TEXT',"'other'"),('offer_mechanic_label','TEXT',"'ข้อเสนออื่น'"),('platform','TEXT',"''"),('claim_mode','TEXT',"'manual'"),('claim_status','TEXT',"'new'"),('description','TEXT',"''"),('instructions','TEXT',"''"),('end_date','TEXT',"''"),('worth','TEXT',"''"),('platforms','TEXT',"''"),('hunter_type','TEXT',"'digital'"),('grade','TEXT',"'C'"),('direct_claim_url','TEXT',"''"),('source_trust','TEXT',"'public'"),('manual_reason','TEXT',"''"),('claimability','TEXT',"'manual'"),('claim_reason','TEXT',"''"),('url_live','INTEGER','0'),('last_verified_at','TEXT',"''")]
+ cols=[('eligibility','TEXT',"'review'"),('eligibility_reason','TEXT',"''"),('simple_offer','INTEGER','0'),('requires_purchase','INTEGER','0'),('requires_card','INTEGER','0'),('requires_subscription','INTEGER','0'),('requires_survey','INTEGER','0'),('requires_referral','INTEGER','0'),('requires_game','INTEGER','0'),('requires_checkin','INTEGER','0'),('offer_mechanic','TEXT',"'other'"),('offer_mechanic_label','TEXT',"'ข้อเสนออื่น'"),('platform','TEXT',"''"),('claim_mode','TEXT',"'manual'"),('claim_status','TEXT',"'new'"),('description','TEXT',"''"),('instructions','TEXT',"''"),('end_date','TEXT',"''"),('worth','TEXT',"''"),('platforms','TEXT',"''"),('hunter_type','TEXT',"'digital'"),('grade','TEXT',"'C'"),('direct_claim_url','TEXT',"''"),('source_trust','TEXT',"'public'"),('manual_reason','TEXT',"''"),('claimability','TEXT',"'manual'"),('claim_reason','TEXT',"''"),('url_live','INTEGER','0'),('last_verified_at','TEXT',"''"),('discount_amount','REAL','0'),('discount_percent','REAL','0'),('min_spend','REAL','0'),('sort_score','REAL','0')]
  for n,t,d in cols:
   if not has_col(c,'deals',n):c.execute(f'ALTER TABLE deals ADD COLUMN {n} {t} DEFAULT {d}')
  c.execute('CREATE TABLE IF NOT EXISTS ledger(id INTEGER PRIMARY KEY AUTOINCREMENT,amount REAL,currency TEXT,status TEXT,reference TEXT,created_at TEXT)')
@@ -129,14 +129,32 @@ def claimability_for(source,elig,simple,rk,url):
  if url:return 'manual','พบรายการ แต่ต้องตรวจเงื่อนไขต้นทางก่อน'
  return 'blocked','ไม่มีหน้ารับที่ตรวจได้'
 
+def discount_values(text,mechanic):
+ x=clean(text).replace(',','')
+ def largest(patterns):
+  values=[]
+  for pattern in patterns:
+   values.extend(float(v) for v in re.findall(pattern,x,re.I))
+  return max(values,default=0)
+ percent=largest([r'(\d+(?:\.\d+)?)\s*%',r'ลด\s*(\d+(?:\.\d+)?)\s*เปอร์เซ็นต์'])
+ amount=largest([r'(?:ลด|คืน|รับ)\s*(?:สูงสุด\s*)?(\d+(?:\.\d+)?)\s*(?:บาท|฿)',r'(\d+(?:\.\d+)?)\s*(?:บาท|฿)\s*(?:ส่วนลด|คืน)'])
+ minimum=largest([r'(?:ขั้นต่ำ|ครบ|เมื่อซื้อ)\s*(\d+(?:\.\d+)?)\s*(?:บาท|฿)'])
+ if mechanic=='free':score=1_000_000_000
+ elif amount:score=100_000_000+amount
+ elif percent:score=10_000_000+percent
+ elif 'ส่งฟรี' in x:score=1_000_000
+ else:score=0
+ return amount,percent,minimum,score
+
 def save_deal(title,url,source,kind,text,description='',instructions='',end_date='',worth='',platforms='',trust='public'):
  if not title or not url:return 0
  elig,reason,country,simple,rp,rc,rs,rv,rr,grade=classify(text,source);rk=risk(text);ht=hunter_type(text)
  mechanic,mechanic_label=offer_mechanic(text)
+ amount,percent,minimum,score=discount_values(text,mechanic)
  rg=int(mechanic=='game');rcheck=int(mechanic=='checkin')
  cl,cr=claimability_for(source,elig,simple,rk,url)
  c=conn();cur=c.execute('''INSERT INTO deals(title,url,source,kind,risk,country,created_at,eligibility,eligibility_reason,simple_offer,requires_purchase,requires_card,requires_subscription,requires_survey,requires_referral,claim_mode,claim_status,description,instructions,end_date,worth,platforms,hunter_type,grade,direct_claim_url,source_trust,manual_reason,claimability,claim_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(url) DO UPDATE SET title=excluded.title,kind=excluded.kind,risk=excluded.risk,country=excluded.country,eligibility=excluded.eligibility,eligibility_reason=excluded.eligibility_reason,simple_offer=excluded.simple_offer,requires_purchase=excluded.requires_purchase,requires_card=excluded.requires_card,requires_subscription=excluded.requires_subscription,requires_survey=excluded.requires_survey,requires_referral=excluded.requires_referral,description=excluded.description,instructions=excluded.instructions,end_date=excluded.end_date,worth=excluded.worth,platforms=excluded.platforms,hunter_type=excluded.hunter_type,grade=excluded.grade,direct_claim_url=excluded.direct_claim_url,source_trust=excluded.source_trust,claimability=excluded.claimability,claim_reason=excluded.claim_reason''',(clean(title)[:300],url,source,kind,rk,country,now(),elig,reason,simple,rp,rc,rs,rv,rr,cl,'ready' if cl in ('auto_api','direct','login') else 'new',clean(description)[:2000],clean(instructions)[:2000],clean(end_date),clean(worth),clean(platforms),ht,grade,url,trust,cr,cl,cr))
- c.execute('UPDATE deals SET requires_game=?,requires_checkin=?,offer_mechanic=?,offer_mechanic_label=?,platform=? WHERE url=?',(rg,rcheck,mechanic,mechanic_label,source,url))
+ c.execute('UPDATE deals SET requires_game=?,requires_checkin=?,offer_mechanic=?,offer_mechanic_label=?,platform=?,discount_amount=?,discount_percent=?,min_spend=?,sort_score=?,created_at=? WHERE url=?',(rg,rcheck,mechanic,mechanic_label,source,amount,percent,minimum,score,now(),url))
  c.commit();c.close();return max(cur.rowcount,0)
 
 async def scan_gamerpower(client):
@@ -192,6 +210,7 @@ async def scan_rss(client,name,url):
 
 async def scan_marketplace(client,source):
  name=source['name'];hub=source['url']
+ c=conn();c.execute("DELETE FROM deals WHERE source=? AND source_trust='official-public-page'",(name,));c.commit();c.close()
  try:
   r=await client.get(hub);r.raise_for_status();soup=BeautifulSoup(r.text,'html.parser');added=found=0;seen=set()
   keywords=FREE+SAMPLE+CASHBACK+COUPON+FLASH+GAME+CHECKIN+REFERRAL+EXCHANGE_PURCHASE+PURCHASE
@@ -281,7 +300,7 @@ async def search():
 def deals(hunter:str='all',mode:str='all',mechanic:str='all',platform:str='all',owner:str='all',scope:str='all'):
  c=conn();q="SELECT * FROM deals WHERE risk!='high'";args=[]
  if scope=='marketplace':
-  marks=','.join('?' for _ in MARKETPLACE_SOURCES);q+=f" AND platform IN ({marks}) AND source_trust='official-entry-point'";args.extend(s['name'] for s in MARKETPLACE_SOURCES)
+  marks=','.join('?' for _ in MARKETPLACE_SOURCES);q+=f" AND platform IN ({marks}) AND source_trust IN ('official-entry-point','official-public-page')";args.extend(s['name'] for s in MARKETPLACE_SOURCES)
  if hunter in ('money','physical','digital'):q+=' AND hunter_type=?';args.append(hunter)
  if mode in ('auto_api','direct','login','manual','blocked'):q+=' AND claimability=?';args.append(mode)
  if mechanic in ('free','coupon','cashback','sample','purchase_required','exchange_purchase','game','checkin','referral','flash_sale','other'):q+=' AND offer_mechanic=?';args.append(mechanic)
@@ -289,7 +308,7 @@ def deals(hunter:str='all',mode:str='all',mechanic:str='all',platform:str='all',
  if platform in known_platforms:q+=' AND platform=?';args.append(platform)
  if owner=='system':q+=" AND claimability='auto_api'"
  elif owner=='user':q+=" AND claimability!='auto_api'"
- q+=" ORDER BY CASE claimability WHEN 'auto_api' THEN 0 WHEN 'direct' THEN 1 WHEN 'login' THEN 2 WHEN 'manual' THEN 3 ELSE 4 END, CASE grade WHEN 'A' THEN 0 WHEN 'B' THEN 1 ELSE 2 END,id DESC LIMIT 500"
+ q+=" ORDER BY sort_score DESC, discount_amount DESC, discount_percent DESC, id DESC LIMIT 500"
  rows=[dict(x) for x in c.execute(q,args)];c.close()
  for d in rows:
   d['auto_claimable']=auto_claimable(d)
@@ -324,7 +343,7 @@ def marketplaces():return [{'name':s['name'],'url':s['url']} for s in MARKETPLAC
 def stats():
  c=conn();
  marketplace_names=','.join("'"+s['name'].replace("'","''")+"'" for s in MARKETPLACE_SOURCES)
- def n(w):return c.execute("SELECT COUNT(*) FROM deals WHERE risk!='high' AND source_trust='official-entry-point' AND platform IN ("+marketplace_names+") AND "+w).fetchone()[0]
+ def n(w):return c.execute("SELECT COUNT(*) FROM deals WHERE risk!='high' AND source_trust IN ('official-entry-point','official-public-page') AND platform IN ("+marketplace_names+") AND "+w).fetchone()[0]
  out={'total':n('1=1'),'money':n("hunter_type='money'"),'physical':n("hunter_type='physical'"),'digital':n("hunter_type='digital'"),'auto_api':n("claimability='auto_api'"),'user_claim':n("claimability!='auto_api'"),'direct':n("claimability='direct'"),'login':n("claimability='login'"),'live':n('url_live=1'),'submitted':n("claim_status='submitted'"),'free':n("offer_mechanic='free'"),'coupon':n("offer_mechanic='coupon'"),'cashback':n("offer_mechanic='cashback'"),'game':n("offer_mechanic='game'")};c.close();return out
 @app.get('/api/readiness')
 def readiness():return {'version':'15.0','target_country':TARGET_COUNTRY,'auto_scan_minutes':30,'authorized_auto_claim_sources':len(authorized_connectors()),'message':'Claimability Engine: แยกรับอัตโนมัติ / รับตรง / ต้องล็อกอิน / ตรวจเอง'}
@@ -342,7 +361,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 <div class=card><b>แหล่งค้นหา</b><div id=health class=muted></div><div id=sources class=sources></div></div>
 <div class=card><b>รายการแยกตามแพลตฟอร์ม</b><div class=filters><select id=mechanic onchange="load()"><option value=all>ทุกประเภท</option><option value=coupon>คูปอง/ส่วนลด</option><option value=flash_sale>Flash Sale</option><option value=cashback>เงินคืน</option><option value=checkin>เหรียญ/เช็กอิน</option></select></div><div id=deals></div></div></div>
 <script>const all='all';</script>
-<script>let platformNames=[];function esc(s){return String(s||'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]))}async function stat(){let s=await fetch('/api/stats').then(r=>r.json());for(let k of ['total','free','coupon','cashback','game','money','physical','digital'])document.getElementById(k).textContent=s[k]||0;let h=await fetch('/api/source-health').then(r=>r.json());health.innerHTML=h.filter(x=>platformNames.includes(x.source)).map(x=>`${esc(x.source)}: ${esc(x.status)} · พบ ${x.found} · ${esc(x.message)}`).join('<br>')}async function setup(){let ms=await fetch('/api/marketplaces').then(r=>r.json());platformNames=ms.map(m=>m.name);for(let m of ms)sources.insertAdjacentHTML('beforeend',`<a href="${esc(m.url)}" target=_blank rel="noopener">${esc(m.name)} ↗</a>`);await load()}function dealCard(d){let live=d.url_live?'<span class="tag auto_api">ตรวจลิงก์แล้ว</span>':'<span class="tag manual">รอตรวจลิงก์</span>';return `<div class=deal><span class="tag ${esc(d.offer_mechanic)}">${esc(d.offer_mechanic_label)}</span>${live}<div><b>${esc(d.title)}</b></div><div class=muted>${esc(d.description||d.claim_owner_reason)}<br>สิทธิ์และส่วนลดขึ้นอยู่กับบัญชีของคุณ</div><a class=go href="/claim/${d.id}" target=_blank rel="noopener">เปิดหน้ารับสิทธิ์ →</a></div>`}function claimSection(items){return `<div class=claim-group><div class=claim-title>เปิดไปกดเก็บในบัญชีของคุณ (${items.length})</div>${items.length?items.map(dealCard).join(''):'<div class=empty>ยังไม่มีรายการ</div>'}</div>`}async function load(){let q=new URLSearchParams({mechanic:mechanic.value,scope:'marketplace'});let ds=await fetch('/api/deals?'+q).then(r=>r.json());deals.innerHTML=platformNames.map(name=>{let items=ds.filter(d=>(d.platform||d.source)===name&&d.claim_owner==='user');return `<section class=platform-group><div class=platform-head><span>${esc(name)}</span><span>${items.length} รายการ</span></div>${claimSection(items)}</section>`}).join('')||'<div class=empty>ยังไม่พบรายการ</div>';await stat()}async function go(){scan.disabled=true;scan.textContent='กำลังค้นหาและตรวจลิงก์ต้นทาง...';let r=await fetch('/api/search').then(r=>r.json());await load();scan.textContent=`พบ ${r.found} จุดรับสิทธิ์ · ลิงก์ใช้ได้ ${r.verified_live}`;setTimeout(()=>{scan.textContent='🌍 ค้นหาและจัดหมวดข้อเสนอจริง';scan.disabled=false},3000)}setup()</script></body></html>'''
+<script>let platformNames=[];function esc(s){return String(s||'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]))}async function stat(){let s=await fetch('/api/stats').then(r=>r.json());for(let k of ['total','free','coupon','cashback','game','money','physical','digital'])document.getElementById(k).textContent=s[k]||0;let h=await fetch('/api/source-health').then(r=>r.json());health.innerHTML=h.filter(x=>platformNames.includes(x.source)).map(x=>`${esc(x.source)}: ${esc(x.status)} · พบ ${x.found} · ${esc(x.message)}`).join('<br>')}async function setup(){let ms=await fetch('/api/marketplaces').then(r=>r.json());platformNames=ms.map(m=>m.name);for(let m of ms)sources.insertAdjacentHTML('beforeend',`<a href="${esc(m.url)}" target=_blank rel="noopener">${esc(m.name)} ↗</a>`);await load()}function valueBadge(d){if(d.offer_mechanic==='free')return '<span class="tag free">ฟรี</span>';if(d.discount_amount>0)return `<span class="tag cashback">ลดสูงสุด ฿${d.discount_amount.toLocaleString()}</span>`;if(d.discount_percent>0)return `<span class="tag coupon">ลด ${d.discount_percent}%</span>`;if((d.title+d.description).includes('ส่งฟรี'))return '<span class="tag coupon">ส่งฟรี</span>';return '<span class="tag manual">ไม่ระบุมูลค่า</span>'}function dealCard(d){let live=d.url_live?'<span class="tag auto_api">ตรวจลิงก์แล้ว</span>':'<span class="tag manual">รอตรวจลิงก์</span>';return `<div class=deal><span class="tag ${esc(d.offer_mechanic)}">${esc(d.offer_mechanic_label)}</span>${valueBadge(d)}${live}<div><b>${esc(d.title)}</b></div><div class=muted>${esc(d.description||d.claim_owner_reason)}${d.min_spend>0?`<br>ยอดขั้นต่ำ ฿${d.min_spend.toLocaleString()}`:''}<br>เรียงตามมูลค่าที่ต้นทางระบุ โดยไม่ประมาณตัวเลขเอง</div><a class=go href="/claim/${d.id}" target=_blank rel="noopener">เปิดหน้ารับสิทธิ์ →</a></div>`}function claimSection(items){return `<div class=claim-group><div class=claim-title>เรียง: ฟรี → ส่วนลดมากไปน้อย (${items.length})</div>${items.length?items.map(dealCard).join(''):'<div class=empty>ยังไม่มีรายการ</div>'}</div>`}async function load(){let q=new URLSearchParams({mechanic:mechanic.value,scope:'marketplace'});let ds=await fetch('/api/deals?'+q).then(r=>r.json());deals.innerHTML=platformNames.map(name=>{let items=ds.filter(d=>(d.platform||d.source)===name&&d.claim_owner==='user');return `<section class=platform-group><div class=platform-head><span>${esc(name)}</span><span>${items.length} รายการ</span></div>${claimSection(items)}</section>`}).join('')||'<div class=empty>ยังไม่พบรายการ</div>';await stat()}async function go(){scan.disabled=true;scan.textContent='กำลังค้นหาและเรียงส่วนลด...';let r=await fetch('/api/search').then(r=>r.json());await load();scan.textContent=`พบ ${r.found} รายการ · เรียงมูลค่าแล้ว`;setTimeout(()=>{scan.textContent='🌍 ค้นหาและจัดหมวดข้อเสนอจริง';scan.disabled=false},3000)}setup()</script></body></html>'''
 
 @app.get('/',response_class=HTMLResponse)
 def home():return HTML_MARKETPLACE
