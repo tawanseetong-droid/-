@@ -37,13 +37,12 @@ RSS_SOURCES=[('Reddit Freebies','https://www.reddit.com/r/freebies/.rss')]
 VERIFY_HOST_SUFFIXES=('gamerpower.com','epicgames.com','steampowered.com','steamcommunity.com')
 MARKETPLACE_SOURCES=[
  {'name':'TikTok Shop','url':'https://shop.tiktok.com/th','hosts':('shop.tiktok.com','tiktok.com')},
- {'name':'Shopee','url':'https://shopee.co.th/m/flash_sale','hosts':('shopee.co.th',)},
+ {'name':'Shopee','url':'https://shopee.co.th/','hosts':('shopee.co.th',)},
  {'name':'Lazada','url':'https://www.lazada.co.th/','hosts':('lazada.co.th',)},
 ]
 MARKETPLACE_ENTRY_POINTS=[
  {'platform':'TikTok Shop','title':'ศูนย์คูปองและโปรโมชัน TikTok Shop','url':'https://shop.tiktok.com/th','kind':'coupon','label':'คูปอง/ส่วนลด','note':'เปิด TikTok Shop แล้วเลือกคูปองที่บัญชีของคุณมีสิทธิ์รับ'},
- {'platform':'Shopee','title':'โค้ดส่งฟรีและคูปอง Shopee','url':'https://shopee.co.th/m/free-shipping-vouchers','kind':'coupon','label':'คูปอง/ส่งฟรี','note':'เปิดหน้าคูปอง Shopee แล้วกดเก็บในบัญชีของคุณ'},
- {'platform':'Shopee','title':'Flash Sale และโค้ดประจำวัน Shopee','url':'https://shopee.co.th/m/flash_sale','kind':'flash_sale','label':'Flash Sale','note':'ตรวจดีลและโค้ดที่ใช้ได้ในช่วงเวลาปัจจุบัน'},
+ {'platform':'Shopee','title':'คูปอง โค้ดส่งฟรี และโปรโมชัน Shopee','url':'https://shopee.co.th/','kind':'coupon','label':'คูปอง/ส่งฟรี','note':'เปิดหน้าแรก Shopee แล้วเลือกเมนูโค้ดส่วนลดหรือส่งฟรีที่แสดงในบัญชีของคุณ'},
  {'platform':'Lazada','title':'คูปองและโปรโมชัน Lazada','url':'https://www.lazada.co.th/','kind':'coupon','label':'คูปอง/ส่วนลด','note':'เปิด Lazada แล้วเข้าหมวดคูปองเพื่อกดเก็บในบัญชี'},
 ]
 
@@ -214,6 +213,8 @@ async def scan_marketplace(client,source):
 
 async def refresh_marketplace_entry_points(client):
  added=live=0
+ active_urls=[item['url'] for item in MARKETPLACE_ENTRY_POINTS]
+ c=conn();marks=','.join('?' for _ in active_urls);c.execute(f"DELETE FROM deals WHERE source_trust='official-entry-point' AND url NOT IN ({marks})",active_urls);c.commit();c.close()
  for item in MARKETPLACE_ENTRY_POINTS:
   url=item['url'];is_live=0
   try:
@@ -280,7 +281,7 @@ async def search():
 def deals(hunter:str='all',mode:str='all',mechanic:str='all',platform:str='all',owner:str='all',scope:str='all'):
  c=conn();q="SELECT * FROM deals WHERE risk!='high'";args=[]
  if scope=='marketplace':
-  marks=','.join('?' for _ in MARKETPLACE_SOURCES);q+=f' AND platform IN ({marks})';args.extend(s['name'] for s in MARKETPLACE_SOURCES)
+  marks=','.join('?' for _ in MARKETPLACE_SOURCES);q+=f" AND platform IN ({marks}) AND source_trust='official-entry-point'";args.extend(s['name'] for s in MARKETPLACE_SOURCES)
  if hunter in ('money','physical','digital'):q+=' AND hunter_type=?';args.append(hunter)
  if mode in ('auto_api','direct','login','manual','blocked'):q+=' AND claimability=?';args.append(mode)
  if mechanic in ('free','coupon','cashback','sample','purchase_required','exchange_purchase','game','checkin','referral','flash_sale','other'):q+=' AND offer_mechanic=?';args.append(mechanic)
@@ -323,7 +324,7 @@ def marketplaces():return [{'name':s['name'],'url':s['url']} for s in MARKETPLAC
 def stats():
  c=conn();
  marketplace_names=','.join("'"+s['name'].replace("'","''")+"'" for s in MARKETPLACE_SOURCES)
- def n(w):return c.execute("SELECT COUNT(*) FROM deals WHERE risk!='high' AND platform IN ("+marketplace_names+") AND "+w).fetchone()[0]
+ def n(w):return c.execute("SELECT COUNT(*) FROM deals WHERE risk!='high' AND source_trust='official-entry-point' AND platform IN ("+marketplace_names+") AND "+w).fetchone()[0]
  out={'total':n('1=1'),'money':n("hunter_type='money'"),'physical':n("hunter_type='physical'"),'digital':n("hunter_type='digital'"),'auto_api':n("claimability='auto_api'"),'user_claim':n("claimability!='auto_api'"),'direct':n("claimability='direct'"),'login':n("claimability='login'"),'live':n('url_live=1'),'submitted':n("claim_status='submitted'"),'free':n("offer_mechanic='free'"),'coupon':n("offer_mechanic='coupon'"),'cashback':n("offer_mechanic='cashback'"),'game':n("offer_mechanic='game'")};c.close();return out
 @app.get('/api/readiness')
 def readiness():return {'version':'15.0','target_country':TARGET_COUNTRY,'auto_scan_minutes':30,'authorized_auto_claim_sources':len(authorized_connectors()),'message':'Claimability Engine: แยกรับอัตโนมัติ / รับตรง / ต้องล็อกอิน / ตรวจเอง'}
