@@ -36,14 +36,15 @@ PHYSICAL=['sample','product testing','tester','beauty','skincare','cosmetic','fo
 RSS_SOURCES=[('Reddit Freebies','https://www.reddit.com/r/freebies/.rss')]
 VERIFY_HOST_SUFFIXES=('gamerpower.com','epicgames.com','steampowered.com','steamcommunity.com')
 MARKETPLACE_SOURCES=[
- {'name':'Shopee','url':'https://shopee.co.th/m/flash_sale','hosts':('shopee.co.th',)},
- {'name':'Lazada','url':'https://www.lazada.co.th/wow/i/th/flashsale/flash-sale','hosts':('lazada.co.th',)},
  {'name':'TikTok Shop','url':'https://shop.tiktok.com/th','hosts':('shop.tiktok.com','tiktok.com')},
- {'name':'Temu','url':'https://www.temu.com/th','hosts':('temu.com',)},
- {'name':'Taobao','url':'https://world.taobao.com/','hosts':('taobao.com','tmall.com')},
- {'name':'AliExpress','url':'https://www.aliexpress.com/','hosts':('aliexpress.com',)},
- {'name':'Amazon','url':'https://www.amazon.com/gp/goldbox','hosts':('amazon.com',)},
- {'name':'eBay','url':'https://www.ebay.com/deals','hosts':('ebay.com',)},
+ {'name':'Shopee','url':'https://shopee.co.th/m/flash_sale','hosts':('shopee.co.th',)},
+ {'name':'Lazada','url':'https://www.lazada.co.th/','hosts':('lazada.co.th',)},
+]
+MARKETPLACE_ENTRY_POINTS=[
+ {'platform':'TikTok Shop','title':'ศูนย์คูปองและโปรโมชัน TikTok Shop','url':'https://shop.tiktok.com/th','kind':'coupon','label':'คูปอง/ส่วนลด','note':'เปิด TikTok Shop แล้วเลือกคูปองที่บัญชีของคุณมีสิทธิ์รับ'},
+ {'platform':'Shopee','title':'โค้ดส่งฟรีและคูปอง Shopee','url':'https://shopee.co.th/m/free-shipping-vouchers','kind':'coupon','label':'คูปอง/ส่งฟรี','note':'เปิดหน้าคูปอง Shopee แล้วกดเก็บในบัญชีของคุณ'},
+ {'platform':'Shopee','title':'Flash Sale และโค้ดประจำวัน Shopee','url':'https://shopee.co.th/m/flash_sale','kind':'flash_sale','label':'Flash Sale','note':'ตรวจดีลและโค้ดที่ใช้ได้ในช่วงเวลาปัจจุบัน'},
+ {'platform':'Lazada','title':'คูปองและโปรโมชัน Lazada','url':'https://www.lazada.co.th/','kind':'coupon','label':'คูปอง/ส่วนลด','note':'เปิด Lazada แล้วเข้าหมวดคูปองเพื่อกดเก็บในบัญชี'},
 ]
 
 
@@ -211,6 +212,20 @@ async def scan_marketplace(client,source):
  except Exception as e:
   health(name,'manual','อ่านหน้าอัตโนมัติไม่ได้ ต้องเปิดแอปตรวจ ('+type(e).__name__+')',0);return 0,0
 
+async def refresh_marketplace_entry_points(client):
+ added=live=0
+ for item in MARKETPLACE_ENTRY_POINTS:
+  url=item['url'];is_live=0
+  try:
+   r=await client.get(url,follow_redirects=True)
+   host=(urlparse(str(r.url)).hostname or '').lower()
+   allowed=next(s['hosts'] for s in MARKETPLACE_SOURCES if s['name']==item['platform'])
+   is_live=int(r.status_code<400 and any(host==h or host.endswith('.'+h) for h in allowed))
+  except Exception:is_live=0
+  added+=save_deal(item['title'],url,item['platform'],item['label'],item['title']+' '+item['note']+' Thailand',description=item['note'],instructions='กดปุ่มเปิดหน้ารับสิทธิ์ แล้วกดเก็บในบัญชีของคุณ',platforms=item['platform'],trust='official-entry-point')
+  c=conn();c.execute("UPDATE deals SET offer_mechanic=?,offer_mechanic_label=?,claimability='login',claim_reason=?,manual_reason=?,url_live=?,last_verified_at=? WHERE url=?",(item['kind'],item['label'],'ต้องเปิดแพลตฟอร์มและกดเก็บด้วยบัญชีของคุณ',item['note'],is_live,now(),url));c.commit();c.close();live+=is_live
+ return added,live
+
 async def verify_official_links(client):
  c=conn();rows=[dict(x) for x in c.execute("SELECT id,direct_claim_url,url FROM deals WHERE source IN ('Epic Games','Steam','GamerPower') AND risk!='high' ORDER BY id DESC LIMIT 120")];c.close();ok=0
  for d in rows:
@@ -224,9 +239,9 @@ async def verify_official_links(client):
  return ok
 
 async def scan_once():
- async with httpx.AsyncClient(headers={'User-Agent':'MoneyHunterAI/15.0 personal-use'},follow_redirects=True,timeout=20) as client:
-  results=await asyncio.gather(scan_gamerpower(client),scan_epic(client),scan_steam(client),*[scan_rss(client,n,u) for n,u in RSS_SOURCES],*[scan_marketplace(client,s) for s in MARKETPLACE_SOURCES]);live=await verify_official_links(client)
-  return {'added':sum(x[0] for x in results),'found':sum(x[1] for x in results),'verified_live':live}
+ async with httpx.AsyncClient(headers={'User-Agent':'MoneyHunterAI/15.0 personal-use'},follow_redirects=True,timeout=20,trust_env=False) as client:
+  results=await asyncio.gather(*[scan_marketplace(client,s) for s in MARKETPLACE_SOURCES]);seeded,live=await refresh_marketplace_entry_points(client)
+  return {'added':sum(x[0] for x in results)+seeded,'found':sum(x[1] for x in results)+len(MARKETPLACE_ENTRY_POINTS),'verified_live':live}
 
 def auto_claimable(d):
  cfg=authorized_connectors().get(d['source']);return bool(AUTO_CLAIM_ENABLED and d.get('claimability')=='auto_api' and isinstance(cfg,dict) and cfg.get('endpoint') and cfg.get('automation_permitted'))
@@ -262,16 +277,30 @@ async def startup():
 async def search():
  s=await scan_once();a,b=await auto_claim_all();return {'ok':True,**s,'claim_attempted':a,'claim_submitted':b}
 @app.get('/api/deals')
-def deals(hunter:str='all',mode:str='all',mechanic:str='all',platform:str='all'):
+def deals(hunter:str='all',mode:str='all',mechanic:str='all',platform:str='all',owner:str='all',scope:str='all'):
  c=conn();q="SELECT * FROM deals WHERE risk!='high'";args=[]
+ if scope=='marketplace':
+  marks=','.join('?' for _ in MARKETPLACE_SOURCES);q+=f' AND platform IN ({marks})';args.extend(s['name'] for s in MARKETPLACE_SOURCES)
  if hunter in ('money','physical','digital'):q+=' AND hunter_type=?';args.append(hunter)
  if mode in ('auto_api','direct','login','manual','blocked'):q+=' AND claimability=?';args.append(mode)
  if mechanic in ('free','coupon','cashback','sample','purchase_required','exchange_purchase','game','checkin','referral','flash_sale','other'):q+=' AND offer_mechanic=?';args.append(mechanic)
  known_platforms={s['name'] for s in MARKETPLACE_SOURCES}|{'GamerPower','Epic Games','Steam','Reddit Freebies'}
  if platform in known_platforms:q+=' AND platform=?';args.append(platform)
+ if owner=='system':q+=" AND claimability='auto_api'"
+ elif owner=='user':q+=" AND claimability!='auto_api'"
  q+=" ORDER BY CASE claimability WHEN 'auto_api' THEN 0 WHEN 'direct' THEN 1 WHEN 'login' THEN 2 WHEN 'manual' THEN 3 ELSE 4 END, CASE grade WHEN 'A' THEN 0 WHEN 'B' THEN 1 ELSE 2 END,id DESC LIMIT 500"
  rows=[dict(x) for x in c.execute(q,args)];c.close()
- for d in rows:d['auto_claimable']=auto_claimable(d)
+ for d in rows:
+  d['auto_claimable']=auto_claimable(d)
+  d['claim_owner']='system' if d['auto_claimable'] else 'user'
+  d['claim_owner_label']='สามมารกดรับให้ได้' if d['auto_claimable'] else 'คุณต้องกดรับเอง'
+  if d['auto_claimable']:d['claim_owner_reason']='ต้นทางอนุญาตระบบอัตโนมัติและไม่ต้องยืนยันแทนผู้ใช้'
+  elif d.get('requires_purchase'):d['claim_owner_reason']='มีเงื่อนไขซื้อหรือชำระเงิน'
+  elif d.get('requires_game'):d['claim_owner_reason']='ต้องเล่นเกมหรือร่วมกิจกรรมด้วยตนเอง'
+  elif d.get('requires_checkin'):d['claim_owner_reason']='ต้องเช็กอินในบัญชีของคุณ'
+  elif d.get('requires_referral'):d['claim_owner_reason']='ต้องเชิญเพื่อนจากบัญชีของคุณ'
+  elif d.get('claimability')=='login':d['claim_owner_reason']='ต้องล็อกอินหรือยืนยันตัวตน'
+  else:d['claim_owner_reason']='ต้นทางยังไม่มีช่องทางอัตโนมัติที่ได้รับอนุญาต'
  return rows
 @app.post('/api/claim/{deal_id}')
 async def claim(deal_id:int):
@@ -293,8 +322,9 @@ def marketplaces():return [{'name':s['name'],'url':s['url']} for s in MARKETPLAC
 @app.get('/api/stats')
 def stats():
  c=conn();
- def n(w):return c.execute('SELECT COUNT(*) FROM deals WHERE risk!=\'high\' AND '+w).fetchone()[0]
- out={'total':n('1=1'),'money':n("hunter_type='money'"),'physical':n("hunter_type='physical'"),'digital':n("hunter_type='digital'"),'auto_api':n("claimability='auto_api'"),'direct':n("claimability='direct'"),'login':n("claimability='login'"),'live':n('url_live=1'),'submitted':n("claim_status='submitted'"),'free':n("offer_mechanic='free'"),'coupon':n("offer_mechanic='coupon'"),'cashback':n("offer_mechanic='cashback'"),'game':n("offer_mechanic='game'")};c.close();return out
+ marketplace_names=','.join("'"+s['name'].replace("'","''")+"'" for s in MARKETPLACE_SOURCES)
+ def n(w):return c.execute("SELECT COUNT(*) FROM deals WHERE risk!='high' AND platform IN ("+marketplace_names+") AND "+w).fetchone()[0]
+ out={'total':n('1=1'),'money':n("hunter_type='money'"),'physical':n("hunter_type='physical'"),'digital':n("hunter_type='digital'"),'auto_api':n("claimability='auto_api'"),'user_claim':n("claimability!='auto_api'"),'direct':n("claimability='direct'"),'login':n("claimability='login'"),'live':n('url_live=1'),'submitted':n("claim_status='submitted'"),'free':n("offer_mechanic='free'"),'coupon':n("offer_mechanic='coupon'"),'cashback':n("offer_mechanic='cashback'"),'game':n("offer_mechanic='game'")};c.close();return out
 @app.get('/api/readiness')
 def readiness():return {'version':'15.0','target_country':TARGET_COUNTRY,'auto_scan_minutes':30,'authorized_auto_claim_sources':len(authorized_connectors()),'message':'Claimability Engine: แยกรับอัตโนมัติ / รับตรง / ต้องล็อกอิน / ตรวจเอง'}
 @app.get('/api/wallet')
@@ -305,12 +335,13 @@ def healthcheck():return {'ok':True,'version':'15.0'}
 
 HTML='''<!doctype html><html lang="th"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Money Hunter AI v15</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f4f6fa;margin:0;color:#172033}.wrap{max-width:1050px;margin:auto;padding:20px}.hero{background:#0f172a;color:#fff;border-radius:24px;padding:24px}.btn{border:0;border-radius:12px;padding:11px 14px;font-weight:750;cursor:pointer}.green{background:#22c55e}.blue{background:#dbeafe}.full{width:100%;margin-top:10px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.card{background:#fff;border-radius:18px;padding:16px;margin-top:12px}.n{font-size:25px;font-weight:800}.muted{color:#697386;font-size:13px}.deal{border-top:1px solid #eee;padding:12px 0}.tag{display:inline-block;background:#eef2ff;border-radius:999px;padding:4px 8px;font-size:12px;margin:2px}.auto_api{background:#dcfce7}.direct{background:#dbeafe}.login{background:#fef3c7}.manual{background:#f3f4f6}.blocked{background:#fee2e2}.go{display:inline-block;text-decoration:none;background:#2563eb;color:#fff;border-radius:11px;padding:9px 12px;font-weight:700;margin-top:7px}@media(max-width:720px){.grid{grid-template-columns:1fr 1fr}}</style></head><body><div class=wrap><div class=hero><b>Money Hunter AI v15 — Claimability Engine</b><div>หาให้เจอ แล้วบอกให้ชัดว่า “รับได้จริงแบบไหน”</div><button id=scan class="btn green full" onclick="go()">🌍 ให้สามมารค้นหาและตรวจหน้ารับจริง</button></div><div class=grid><div class=card><div>พบทั้งหมด</div><div class=n id=total>0</div></div><div class=card><div>🤖 รับอัตโนมัติ</div><div class=n id=autoapi>0</div></div><div class=card><div>🎯 หน้ารับตรง</div><div class=n id=direct>0</div></div><div class=card><div>🔐 ต้องล็อกอิน</div><div class=n id=login>0</div></div><div class=card><div>ลิงก์ตรวจแล้ว</div><div class=n id=live>0</div></div><div class=card><div>💰 เงิน</div><div class=n id=money>0</div></div><div class=card><div>🎁 สินค้า</div><div class=n id=physical>0</div></div><div class=card><div>💻 ดิจิทัล</div><div class=n id=digital>0</div></div></div><div class=card><b>แหล่งค้นหา</b><div id=health class=muted></div></div><div class=card><button class="btn blue" onclick="load('all')">ทั้งหมด</button><button class="btn blue" onclick="load('auto_api')">🤖 รับอัตโนมัติ</button><button class="btn blue" onclick="load('direct')">🎯 รับตรง</button><button class="btn blue" onclick="load('login')">🔐 ต้องล็อกอิน</button><div id=deals></div></div></div><script>function esc(s){return String(s||'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]))}async function stat(){let s=await fetch('/api/stats').then(r=>r.json());for(let k of ['total','money','physical','digital','direct','login','live'])document.getElementById(k).textContent=s[k];autoapi.textContent=s.auto_api;let h=await fetch('/api/source-health').then(r=>r.json());health.innerHTML=h.map(x=>`${esc(x.source)}: ${esc(x.status)} · พบ ${x.found}`).join('<br>')}async function load(mode='all'){let ds=await fetch('/api/deals?mode='+mode).then(r=>r.json());deals.innerHTML=ds.slice(0,100).map(d=>{let action=d.auto_claimable?`<button class="btn green" onclick="claim(${d.id},this)">AI รับให้เลย</button>`:(d.claimability==='direct'||d.claimability==='login'?`<a class=go href="/claim/${d.id}" target="_blank">${d.claimability==='login'?'ไปล็อกอินแล้วรับ →':'ไปหน้ารับตรง →'}</a>`:'');return `<div class=deal><span class="tag ${esc(d.claimability)}">${esc(d.claimability)}</span><span class=tag>เกรด ${esc(d.grade)}</span><span class=tag>${esc(d.source)}</span>${d.url_live?'<span class="tag auto_api">ลิงก์ใช้งานได้</span>':''}<div><b>${esc(d.title)}</b></div><div class=muted>${esc(d.claim_reason)} ${d.worth?'· '+esc(d.worth):''}</div>${action}</div>`}).join('')||'ยังไม่มีรายการในหมวดนี้';await stat()}async function go(){scan.disabled=true;scan.textContent='กำลังค้นหา + ตรวจลิงก์ต้นทาง...';let r=await fetch('/api/search').then(r=>r.json());await load();scan.textContent='พบ '+r.found+' · ตรวจลิงก์ใช้งานได้ '+r.verified_live;setTimeout(()=>{scan.textContent='🌍 ให้สามมารค้นหาและตรวจหน้ารับจริง';scan.disabled=false},2500)}async function claim(id,b){b.disabled=true;let r=await fetch('/api/claim/'+id,{method:'POST'}).then(r=>r.json());alert(r.message);await load()}load()</script></body></html>'''
 HTML_MARKETPLACE='''<!doctype html><html lang="th"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Money Hunter AI v15</title><style>
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f4f6fa;margin:0;color:#172033}.wrap{max-width:1080px;margin:auto;padding:20px}.hero{background:linear-gradient(135deg,#0f172a,#164e63);color:#fff;border-radius:24px;padding:24px}.btn{border:0;border-radius:12px;padding:11px 14px;font-weight:750;cursor:pointer}.green{background:#22c55e}.blue{background:#dbeafe}.full{width:100%;margin-top:12px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.card{background:#fff;border-radius:18px;padding:16px;margin-top:12px}.n{font-size:25px;font-weight:800}.muted{color:#697386;font-size:13px}.deal{border-top:1px solid #eee;padding:12px 0}.tag{display:inline-block;background:#eef2ff;border-radius:999px;padding:4px 8px;font-size:12px;margin:2px}.auto_api,.free{background:#dcfce7}.direct,.coupon{background:#dbeafe}.login,.game,.checkin{background:#fef3c7}.cashback{background:#fae8ff}.purchase_required,.exchange_purchase{background:#ffedd5}.go{display:inline-block;text-decoration:none;background:#2563eb;color:#fff;border-radius:11px;padding:9px 12px;font-weight:700;margin-top:7px}.filters{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:12px 0}.filters select{padding:11px;border:1px solid #d9dee8;border-radius:11px;background:#fff;font-size:14px}.sources a{display:inline-block;margin:6px 8px 0 0;color:#1d4ed8}@media(max-width:720px){.grid{grid-template-columns:1fr 1fr}.filters{grid-template-columns:1fr}}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f4f6fa;margin:0;color:#172033}.wrap{max-width:1080px;margin:auto;padding:20px}.hero{background:linear-gradient(135deg,#0f172a,#164e63);color:#fff;border-radius:24px;padding:24px}.btn{border:0;border-radius:12px;padding:11px 14px;font-weight:750;cursor:pointer}.green{background:#22c55e}.blue{background:#dbeafe}.full{width:100%;margin-top:12px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.card{background:#fff;border-radius:18px;padding:16px;margin-top:12px}.n{font-size:25px;font-weight:800}.muted{color:#697386;font-size:13px}.deal{border-top:1px solid #eee;padding:12px 0}.tag{display:inline-block;background:#eef2ff;border-radius:999px;padding:4px 8px;font-size:12px;margin:2px}.auto_api,.free,.system{background:#dcfce7}.direct,.coupon{background:#dbeafe}.login,.game,.checkin,.user{background:#fef3c7}.cashback{background:#fae8ff}.purchase_required,.exchange_purchase{background:#ffedd5}.go{display:inline-block;text-decoration:none;background:#2563eb;color:#fff;border-radius:11px;padding:9px 12px;font-weight:700;margin-top:7px}.claim-ai{background:#16a34a;color:#fff}.filters{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:12px 0}.filters select{padding:11px;border:1px solid #d9dee8;border-radius:11px;background:#fff;font-size:14px}.sources a{display:inline-block;margin:6px 8px 0 0;color:#1d4ed8}.platform-group{border:1px solid #e5e7eb;border-radius:16px;margin:14px 0;overflow:hidden}.platform-head{display:flex;justify-content:space-between;align-items:center;background:#eef2ff;padding:14px 16px;font-size:18px;font-weight:800}.claim-group{padding:12px 16px}.claim-group+.claim-group{border-top:1px dashed #d1d5db}.claim-title{font-weight:750;margin-bottom:6px}.empty{color:#94a3b8;padding:8px 0}@media(max-width:720px){.grid{grid-template-columns:1fr 1fr}.filters{grid-template-columns:1fr}}
 </style></head><body><div class=wrap><div class=hero><b>Money Hunter AI v15 — Marketplace Rewards</b><div>ค้นหาเงินจริง ของรางวัล ของแจก และส่วนลด พร้อมแยกเงื่อนไขก่อนกดรับ</div><button id=scan class="btn green full" onclick="go()">🌍 ค้นหาและจัดหมวดข้อเสนอจริง</button></div>
 <div class=grid><div class=card><div>พบทั้งหมด</div><div class=n id=total>0</div></div><div class=card><div>แจกฟรี</div><div class=n id=free>0</div></div><div class=card><div>คูปอง/ส่วนลด</div><div class=n id=coupon>0</div></div><div class=card><div>เงินคืน</div><div class=n id=cashback>0</div></div><div class=card><div>เล่นเกม</div><div class=n id=game>0</div></div><div class=card><div>เงินจริง</div><div class=n id=money>0</div></div><div class=card><div>สินค้าจริง</div><div class=n id=physical>0</div></div><div class=card><div>ดิจิทัล</div><div class=n id=digital>0</div></div></div>
 <div class=card><b>แหล่งค้นหา</b><div id=health class=muted></div><div id=sources class=sources></div></div>
-<div class=card><b>แยกตามเงื่อนไข</b><div class=filters><select id=mechanic onchange="load()"><option value=all>ทุกประเภท</option><option value=free>แจกฟรี</option><option value=coupon>คูปอง/ส่วนลด</option><option value=cashback>เงินคืน</option><option value=sample>ทดลองสินค้า</option><option value=purchase_required>ต้องซื้อก่อน</option><option value=exchange_purchase>แลกซื้อ/ซื้อเพิ่ม</option><option value=game>เล่นเกม/ลุ้นรางวัล</option><option value=checkin>เช็กอิน/เก็บเหรียญ</option><option value=referral>เชิญเพื่อน</option><option value=flash_sale>Flash Sale</option></select><select id=platform onchange="load()"><option value=all>ทุกแพลตฟอร์ม</option></select></div><div id=deals></div></div></div>
-<script>function esc(s){return String(s||'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]))}async function stat(){let s=await fetch('/api/stats').then(r=>r.json());for(let k of ['total','free','coupon','cashback','game','money','physical','digital'])document.getElementById(k).textContent=s[k]||0;let h=await fetch('/api/source-health').then(r=>r.json());health.innerHTML=h.map(x=>`${esc(x.source)}: ${esc(x.status)} · พบ ${x.found} · ${esc(x.message)}`).join('<br>')}async function setup(){let ms=await fetch('/api/marketplaces').then(r=>r.json());for(let m of ms){platform.insertAdjacentHTML('beforeend',`<option value="${esc(m.name)}">${esc(m.name)}</option>`);sources.insertAdjacentHTML('beforeend',`<a href="${esc(m.url)}" target=_blank rel="noopener">${esc(m.name)} ↗</a>`)}await load()}async function load(){let q=new URLSearchParams({mechanic:mechanic.value,platform:platform.value});let ds=await fetch('/api/deals?'+q).then(r=>r.json());deals.innerHTML=ds.slice(0,150).map(d=>`<div class=deal><span class="tag ${esc(d.offer_mechanic)}">${esc(d.offer_mechanic_label)}</span><span class=tag>${esc(d.platform||d.source)}</span><span class=tag>เกรด ${esc(d.grade)}</span><div><b>${esc(d.title)}</b></div><div class=muted>${esc(d.eligibility_reason)} · ${esc(d.claim_reason)}</div><a class=go href="/claim/${d.id}" target=_blank>ตรวจเงื่อนไขที่ต้นทาง →</a></div>`).join('')||'ยังไม่พบรายการในหมวดนี้';await stat()}async function go(){scan.disabled=true;scan.textContent='กำลังค้นหาและตรวจเงื่อนไข...';let r=await fetch('/api/search').then(r=>r.json());await load();scan.textContent=`พบ ${r.found} รายการ`;setTimeout(()=>{scan.textContent='🌍 ค้นหาและจัดหมวดข้อเสนอจริง';scan.disabled=false},2500)}setup()</script></body></html>'''
+<div class=card><b>รายการแยกตามแพลตฟอร์ม</b><div class=filters><select id=mechanic onchange="load()"><option value=all>ทุกประเภท</option><option value=coupon>คูปอง/ส่วนลด</option><option value=flash_sale>Flash Sale</option><option value=cashback>เงินคืน</option><option value=checkin>เหรียญ/เช็กอิน</option></select></div><div id=deals></div></div></div>
+<script>const all='all';</script>
+<script>let platformNames=[];function esc(s){return String(s||'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]))}async function stat(){let s=await fetch('/api/stats').then(r=>r.json());for(let k of ['total','free','coupon','cashback','game','money','physical','digital'])document.getElementById(k).textContent=s[k]||0;let h=await fetch('/api/source-health').then(r=>r.json());health.innerHTML=h.filter(x=>platformNames.includes(x.source)).map(x=>`${esc(x.source)}: ${esc(x.status)} · พบ ${x.found} · ${esc(x.message)}`).join('<br>')}async function setup(){let ms=await fetch('/api/marketplaces').then(r=>r.json());platformNames=ms.map(m=>m.name);for(let m of ms)sources.insertAdjacentHTML('beforeend',`<a href="${esc(m.url)}" target=_blank rel="noopener">${esc(m.name)} ↗</a>`);await load()}function dealCard(d){let live=d.url_live?'<span class="tag auto_api">ตรวจลิงก์แล้ว</span>':'<span class="tag manual">รอตรวจลิงก์</span>';return `<div class=deal><span class="tag ${esc(d.offer_mechanic)}">${esc(d.offer_mechanic_label)}</span>${live}<div><b>${esc(d.title)}</b></div><div class=muted>${esc(d.description||d.claim_owner_reason)}<br>สิทธิ์และส่วนลดขึ้นอยู่กับบัญชีของคุณ</div><a class=go href="/claim/${d.id}" target=_blank rel="noopener">เปิดหน้ารับสิทธิ์ →</a></div>`}function claimSection(items){return `<div class=claim-group><div class=claim-title>เปิดไปกดเก็บในบัญชีของคุณ (${items.length})</div>${items.length?items.map(dealCard).join(''):'<div class=empty>ยังไม่มีรายการ</div>'}</div>`}async function load(){let q=new URLSearchParams({mechanic:mechanic.value,scope:'marketplace'});let ds=await fetch('/api/deals?'+q).then(r=>r.json());deals.innerHTML=platformNames.map(name=>{let items=ds.filter(d=>(d.platform||d.source)===name&&d.claim_owner==='user');return `<section class=platform-group><div class=platform-head><span>${esc(name)}</span><span>${items.length} รายการ</span></div>${claimSection(items)}</section>`}).join('')||'<div class=empty>ยังไม่พบรายการ</div>';await stat()}async function go(){scan.disabled=true;scan.textContent='กำลังค้นหาและตรวจลิงก์ต้นทาง...';let r=await fetch('/api/search').then(r=>r.json());await load();scan.textContent=`พบ ${r.found} จุดรับสิทธิ์ · ลิงก์ใช้ได้ ${r.verified_live}`;setTimeout(()=>{scan.textContent='🌍 ค้นหาและจัดหมวดข้อเสนอจริง';scan.disabled=false},3000)}setup()</script></body></html>'''
 
 @app.get('/',response_class=HTMLResponse)
 def home():return HTML_MARKETPLACE
